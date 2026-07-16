@@ -26,7 +26,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from chaos import inject
-from demo.run_demo import fabric_event, run
+from demo.run_demo import fabric_event, run, task_detail
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 INDEX = os.path.join(HERE, "static", "index.html")
@@ -84,7 +84,28 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Cognition Fabric", lifespan=lifespan)
-STATE: dict = {"mesh": None, "running": False, "thread": None}
+STATE: dict = {"mesh": None, "running": False, "thread": None,
+               # idx -> the full row, transcript included. Kept server-side and
+               # served on demand: 30 signed transcripts is a lot of bytes to push
+               # at a browser that may never click anything.
+               "rows": {}, "step": None}
+
+
+def _gate(idx: int) -> None:
+    """Single-step mode. Blocks the demo worker until /step is posted.
+
+    Waits on an Event rather than polling, and re-arms after each release, so the
+    run advances exactly one task per press. Timeout is a safety valve: a browser
+    that closes mid-step must not strand the worker thread forever.
+    """
+    ev = STATE.get("step")
+    if ev is None:
+        return
+    hub.publish({"type": "awaiting_step", "idx": idx})
+    if not ev.wait(timeout=900):
+        STATE["step"] = None  # nobody is watching; stop gating and finish the run
+        return
+    ev.clear()
 
 
 def _on_record(rec: dict) -> None:
@@ -108,7 +129,9 @@ def _run_demo(seed: int, fabric_on: bool, analyzer: str, pace: float, out_dir: s
 
         mesh, _rows, _marks = run(seed, fabric_on, quiet=True, out_dir=out_dir,
                                   pace=pace, analyzer=analyzer, on_event=hub.publish,
-                                  on_record=_on_record)
+                                  on_record=_on_record,
+                                  on_row=lambda r: STATE["rows"].__setitem__(r["task"].idx, r),
+                                  gate=_gate)
         STATE["mesh"] = mesh
     except Exception as e:  # a crashed run must say so, not hang the page
         hub.publish({"type": "error", "detail": f"{type(e).__name__}: {e}"})
@@ -129,17 +152,42 @@ async def state() -> JSONResponse:
 
 @app.post("/run")
 async def start(seed: int = 42, fabric: str = "on", analyzer: str = "rules",
-                pace: float = 0.25, out: str = "out/ui") -> JSONResponse:
+                pace: float = 0.6, step: bool = False, out: str = "out/ui") -> JSONResponse:
     if STATE["running"]:
         return JSONResponse({"ok": False, "detail": "already running"}, status_code=409)
     STATE["running"] = True
     STATE["mesh"] = None
+    STATE["rows"] = {}
+    STATE["step"] = threading.Event() if step else None
     hub.reset()
     t = threading.Thread(target=_run_demo, daemon=True,
-                         args=(seed, fabric == "on", analyzer, pace, out))
+                         args=(seed, fabric == "on", analyzer, 0.0 if step else pace, out))
     STATE["thread"] = t
     t.start()
     return JSONResponse({"ok": True})
+
+
+@app.post("/step")
+async def step_once(all: bool = False) -> JSONResponse:
+    """Advance one task. `all=true` drops the gate and lets the run finish."""
+    ev = STATE.get("step")
+    if ev is None:
+        return JSONResponse({"ok": False, "detail": "not in step mode"}, status_code=409)
+    if all:
+        STATE["step"] = None
+    ev.set()
+    return JSONResponse({"ok": True, "stepping": not all})
+
+
+@app.get("/task/{idx}")
+async def task(idx: int) -> JSONResponse:
+    """Everything behind one task line -- declared intent, the feasible region,
+    every signed envelope, the contract. Built on demand from the stored row."""
+    row = STATE["rows"].get(idx)
+    if row is None:
+        return JSONResponse({"ok": False, "detail": f"no task {idx} in this run"},
+                            status_code=404)
+    return JSONResponse(_jsonable(task_detail(row)))
 
 
 @app.post("/chaos/{fault}")

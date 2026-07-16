@@ -61,7 +61,20 @@
   th{color:var(--dim);font-weight:600}
   .step{display:flex;gap:8px;align-items:baseline;padding:2px 0}
   .step .k{color:var(--dim);min-width:96px}
-  #stream .row:first-child{background:#1f6feb22}
+  #stream .row:last-child{background:#1f6feb22}
+  .tappable{cursor:pointer;border-left:2px solid transparent;padding-left:4px}
+  .tappable:hover{background:#1f6feb18;border-left-color:var(--on)}
+  #modal{position:fixed;inset:0;background:#000b;display:none;z-index:50;overflow:auto;padding:24px}
+  #modal.on{display:block}
+  #sheet{max-width:1080px;margin:0 auto;background:var(--panel);border:1px solid var(--line);
+         border-radius:8px;padding:18px 20px}
+  #sheet h3{margin:14px 0 6px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+            color:var(--on)}
+  #sheet table{border-collapse:collapse;width:100%;font-size:11px}
+  #sheet td,#sheet th{padding:2px 8px 2px 0;text-align:left;vertical-align:top;
+                      border-bottom:1px solid #ffffff0d}
+  #sheet th{color:var(--dim);font-weight:normal}
+  .x{float:right;cursor:pointer;color:var(--dim);font-size:16px;line-height:1}
   .hint{color:var(--dim);font-size:11px;padding:6px 11px;border-top:1px solid var(--line)}
   .pill{border-radius:9px;padding:0 7px;font-size:11px;background:#21262d;border:1px solid #30363d}
 </style>
@@ -78,11 +91,16 @@
   </label>
   <label>pace
     <select id="pace">
-      <option value="0.25">0.25s</option><option value="0.1">0.1s</option>
-      <option value="0.6">0.6s</option><option value="0">full speed</option>
+      <option value="0.6">~20s run</option>
+      <option value="0.45">~15s run</option>
+      <option value="0.25">~9s run</option>
+      <option value="0">full speed</option>
+      <option value="step">single-step</option>
     </select>
   </label>
   <button class="go" id="run">▶ Run 30 tasks</button>
+  <button class="go" id="step" style="display:none">Step ▶</button>
+  <button class="chaos" id="finish" style="display:none">Run out</button>
   <button class="chaos" id="f1" disabled>F1 node down</button>
   <button class="chaos" id="f2" disabled>F2 poison ×4</button>
   <button class="chaos" id="f3" disabled>F3 partition</button>
@@ -126,6 +144,8 @@
   </section>
 </div>
 
+<div id="modal"><div id="sheet"></div></div>
+
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
@@ -164,7 +184,16 @@ function addTask(e){
     note += ` <span class="ok">← N3 reuses N1's insight — it never saw the incident</span>`;
   d.innerHTML = `task ${pad(e.idx,2)} ${lq} ${esc(e.node)}×${esc(e.peer)} ${out} `
               + `epoch=${e.epoch} insights=[${esc(ins)}]${note}`;
-  $("stream").prepend(d);
+  // Chronological, and pinned to the bottom. The story is "it learns at 13, then
+  // reuses" -- newest-first told that backwards, with the payoff scrolled off the
+  // top before the setup had happened.
+  d.className += " tappable";
+  d.dataset.idx = e.idx;
+  d.title = "click for the full handshake log";
+  const s = $("stream");
+  const stick = s.scrollTop + s.clientHeight >= s.scrollHeight - 40;
+  s.appendChild(d);
+  if(stick) s.scrollTop = s.scrollHeight;   // don't yank the view if they scrolled up
   drawBars();
 }
 
@@ -300,6 +329,88 @@ function drawChaos(e){
   drawGuardrail(html);
 }
 
+/* ---- per-task drill-down ---- */
+function fmtPoint(p){ return p ? Object.entries(p).map(([k,v])=>`${k}=${v}`).join("  ") : ""; }
+
+async function openTask(idx){
+  const r = await fetch("/task/"+idx);
+  if(!r.ok){ alert((await r.json()).detail); return; }
+  const d = await r.json();
+  const cfg = d.config, c = d.contract;
+
+  const declared = d.declared.map(a=>`
+    <div style="margin-bottom:6px">
+      <div class="b">${esc(a.agent)} <span class="dim">(${esc(a.persona)})</span></div>
+      <div class="dim">objectives : ${a.objectives.map(esc).join(", ")}</div>
+      <div class="dim">competence : ${esc(JSON.stringify(a.competence))}</div>
+      <div class="dim">eff.weights: ${esc(JSON.stringify(a.eff_weights))}</div>
+      ${a.hard.map(h=>`<div class="dim">hard&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; : ${esc(h)}</div>`).join("")}
+      <div class="dim">payload    : ${a.bytes} bytes of typed structure — no prompt history</div>
+    </div>`).join("");
+
+  const region = d.region.map(x=>`<tr><td>${esc(x.dim)}</td><td class="dim">${esc(x.type)}</td>
+      <td>${esc(x.domain)}</td></tr>`).join("");
+
+  const msgs = d.messages.map(m=>`<tr>
+      <td>${esc(m.type)}</td><td class="dim">${esc(m.from)}</td>
+      <td>${m.round??""}</td>
+      <td class="${m.u_a!=null?"":"dim"}">${m.u_a??""}</td><td>${m.u_b??""}</td>
+      <td>${m.point?esc(fmtPoint(m.point)):`<span class="dim">${esc(m.detail||"")}</span>`}</td>
+      <td class="dim">${m.ts_ms}ms</td><td class="dim">${esc(m.sig)}</td></tr>`).join("");
+
+  $("sheet").innerHTML = `
+    <span class="x" onclick="closeTask()">✕</span>
+    <div class="b" style="font-size:14px">task ${d.idx} — ${esc(d.pair)}
+      <span class="${d.ctx.link_quality==="lossy"?"warn":"dim"}">[${esc(d.ctx.link_quality)}]</span>
+      <span class="dim">act ${d.act} · ${esc(d.era)}</span></div>
+
+    <h3>1 · Config this session opened with</h3>
+    <div class="dim">epoch=${cfg.epoch} · insights=[${cfg.insight_ids.map(esc).join(",")||"none"}]
+      · params=${esc(JSON.stringify(cfg.params))}</div>
+    <div class="${cfg.warm_start?"cy":"dim"}">warm_start: ${cfg.warm_start?esc(fmtPoint(cfg.warm_start)):"none — opening from own optimum"}</div>
+    <div class="dim" style="margin-top:4px">Sessions read config once, at start. A fabric
+      update mid-flight never mutates a running negotiation.</div>
+
+    <h3>2 · Declared intent — the entire disclosure</h3>
+    ${declared}
+
+    <h3>3 · Feasible region — intersection of hard constraints, per type</h3>
+    <table><tr><th>dim</th><th>type</th><th>domain</th></tr>${region}</table>
+    <div class="dim" style="margin-top:4px">relaxed: ${d.relaxed.length?esc(JSON.stringify(d.relaxed)):"nothing — non-empty on first intersection"}
+      · ${d.feasible_points} physically realizable points (grid ∩ coupling model)</div>
+
+    <h3>4 · Transcript — ${d.messages.length} signed envelopes</h3>
+    <table><tr><th>msg</th><th>from</th><th>rnd</th><th>u_A</th><th>u_B</th>
+      <th>point / detail</th><th>t</th><th>sig</th></tr>${msgs}</table>
+    <div class="dim" style="margin-top:4px">u_A / u_B are recomputed here from the DISCLOSED
+      descriptors alone — both agents, and you, derive the same numbers, which is why the
+      outcome is deterministic without either side revealing a private bottom line.</div>
+
+    <h3>5 · Outcome</h3>
+    ${c ? `<div>contract <span class="ok">${esc(c.contract_id)}</span> ·
+        resolved_by=${esc(c.resolved_by)} · rounds=${d.result.rounds} ·
+        dur=${d.result.duration_ms}ms · warm_started=${c.warm_started}</div>
+      <div style="margin:4px 0">agreed: <span class="b">${esc(fmtPoint(c.agreed))}</span></div>
+      <div class="dim">authority: ${esc(JSON.stringify(c.authority))}</div>
+      <div class="dim">signatures: ${c.signatures.map(esc).join(", ")} ·
+        transcript_hash=${esc(d.result.transcript_hash)}</div>
+      <div style="margin-top:4px">u_A=${c.u_a} u_B=${c.u_b}
+        <span class="dim">— neither got its optimum; both are bound</span></div>
+      <div>enforcement: ${Object.entries(c.enforced).map(([k,v])=>
+        `${esc(k)} <span class="${v?"ok":"bad"}">${v?"SATISFIED":"VIOLATED"}</span>`).join(" · ")}
+        <span class="dim">— re-checked here, not asserted</span></div>`
+      : `<div class="bad">ABORT(${esc(d.result.abort_reason)}) after ${d.result.duration_ms}ms
+         — no contract. Fail closed.</div>`}`;
+  $("modal").classList.add("on");
+}
+function closeTask(){ $("modal").classList.remove("on"); }
+$("stream").addEventListener("click", ev => {
+  const row = ev.target.closest(".tappable");
+  if(row) openTask(Number(row.dataset.idx));
+});
+$("modal").addEventListener("click", ev => { if(ev.target.id === "modal") closeTask(); });
+addEventListener("keydown", ev => { if(ev.key === "Escape") closeTask(); });
+
 /* ---- wire ---- */
 const handlers = {
   run_start: e => { if(e.fabric_on){ $("stream").innerHTML=""; onRounds={}; setRunning(true);} },
@@ -323,8 +434,10 @@ const handlers = {
     n.textContent = e.text.replace(/^\[analyzer\]\s*/, "analyzer: ");
     n.title = e.text;
   },
+  awaiting_step: e => { $("status").textContent = `paused before task ${e.idx}`;
+                        $("status").style.color = "var(--on)"; },
   run_end: () => { setRunning(false); enableChaos(true); },
-  idle: () => setRunning(false),
+  idle: () => { setRunning(false); setStepping(false); },
   error: e => { $("status").textContent = "error"; $("status").style.color="var(--bad)";
                 console.error(e.detail); alert("run failed: " + e.detail); },
 };
@@ -336,13 +449,24 @@ function connect(){
 }
 connect();
 
+function setStepping(v){
+  $("step").style.display = v ? "" : "none";
+  $("finish").style.display = v ? "" : "none";
+}
+
 $("run").onclick = async () => {
   enableChaos(false);
+  const stepMode = $("pace").value === "step";
   const q = new URLSearchParams({seed:$("seed").value, fabric:"on",
-                                analyzer:$("analyzer").value, pace:$("pace").value});
+                                analyzer:$("analyzer").value,
+                                pace: stepMode ? "0" : $("pace").value,
+                                step: stepMode});
   const r = await fetch("/run?"+q, {method:"POST"});
-  if(!r.ok) alert((await r.json()).detail);
+  if(!r.ok){ alert((await r.json()).detail); return; }
+  setStepping(stepMode);
 };
+$("step").onclick = () => fetch("/step", {method:"POST"});
+$("finish").onclick = async () => { await fetch("/step?all=true", {method:"POST"}); setStepping(false); };
 for(const f of ["f1","f2","f3"]) $(f).onclick = async () => {
   const r = await fetch("/chaos/"+f, {method:"POST"});
   if(!r.ok) alert((await r.json()).detail);

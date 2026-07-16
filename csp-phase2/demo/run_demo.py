@@ -111,6 +111,114 @@ def narrate_pipeline(rep: dict, inc) -> None:
         print(f"    -> {C['warn']}{rep['status']}{C['x']}")
 
 
+def _render_domain(d: str, box: dict) -> str:
+    """A feasible region a human can read: levels by name, not index."""
+    from core.registry import DIM, levels
+    t, b = DIM[d]["type"], box[d]
+    if t == "continuous":
+        return f"[{b[0]:g}, {b[1]:g}]"
+    if t == "ordinal":
+        return "{" + ", ".join(levels(d)[b[0]:b[1] + 1]) + "}"
+    return "{" + ", ".join(str(x) for x in sorted(b)) + "}"
+
+
+def task_detail(row: dict) -> dict:
+    """Everything behind one task line: declared intent, the intersection, every
+    signed envelope, and the contract. Rebuilt from the row rather than logged
+    during the run -- feasibility is a pure function of the two declarations, so
+    recomputing it here cannot drift from what the engine did, and a transcript we
+    already have signed in memory needs no second copy.
+
+    This is the answer to "prove the agents really negotiated": the utilities below
+    are recomputed from the DISCLOSED descriptors alone, so anyone can re-derive
+    them without either agent revealing a private bottom line.
+    """
+    from core.crypto import canonical
+    from core.csp_mini import (
+        descriptor, effective_weights, feasible_box, feasible_points, hard_ok, utility,
+    )
+    from core.registry import DIM, DIM_IDS
+
+    res, t = row["result"], row["task"]
+    cfg_a, cfg_b = row["cfg_a"], row["cfg_b"]
+    box, relaxed = feasible_box([cfg_a, cfg_b])
+
+    declared = [{
+        "agent": c.agent_id, "persona": c.persona,
+        "objectives": [f"{o['direction']} {o['dim'].split('/')[1]} w={o['weight']}"
+                       for o in c.objectives],
+        "hard": [f"{h['dim'].split('/')[1]} {h['op']} {h['value']}  [{h['class']}]"
+                 for h in c.hard],
+        "competence": {k.split("/")[1]: v for k, v in sorted(c.competence.items())},
+        "eff_weights": {k.split("/")[1]: round(v, 3)
+                        for k, v in sorted(effective_weights(c).items())},
+        "bytes": len(canonical(descriptor(c))),
+    } for c in (cfg_a, cfg_b)]
+
+    region, points = [], 0
+    if box is not None:
+        region = [{"dim": d.split("/")[1], "type": DIM[d]["type"],
+                   "domain": _render_domain(d, box)} for d in DIM_IDS]
+        points = len(feasible_points(box, row["params"].get("grid_k", 9)))
+
+    wa, wb = effective_weights(cfg_a), effective_weights(cfg_b)
+    msgs = []
+    for env in res.transcript:
+        pay = env["payload"]
+        pt = pay.get("point")
+        row_ = {"type": env["type"], "from": env["from"], "to": env["to"],
+                "seq": env["seq"], "round": pay.get("round"),
+                "ts_ms": round(env["ts_ms"], 1), "sig": env["sig"][:12] + "...",
+                "bytes": len(canonical(env))}
+        if pt and box is not None:
+            row_["point"] = {k.split("/")[1]: v for k, v in pt.items()}
+            row_["u_a"] = round(utility(cfg_a, pt, box, wa), 3)
+            row_["u_b"] = round(utility(cfg_b, pt, box, wb), 3)
+        elif env["type"] == "ACCEPT":
+            row_["detail"] = f"point_hash={pay['point_hash']}"
+        elif env["type"] == "INTENT_DECLARE":
+            row_["detail"] = f"descriptor for {pay['descriptor']['agent']}"
+        elif env["type"] in ("COMMIT", "COMMIT_ACK"):
+            row_["detail"] = (f"contract {pay['contract']['contract_id']} "
+                              f"sigs={len(pay['contract']['signatures'])}")
+        elif env["type"] == "SETTLE":
+            row_["detail"] = f"reason={pay.get('reason')}"
+        msgs.append(row_)
+
+    c = res.contract
+    return {
+        "idx": t.idx, "era": t.era, "act": ACT_OF_ERA[t.era],
+        "ctx": {k: v for k, v in t.ctx.items() if k != "pair"},
+        "pair": f"{row['node']}x{row['peer']}",
+        "config": {"epoch": row["epoch"], "insight_ids": row["insight_ids"],
+                   "params": {k: row["params"][k] for k in
+                              ("eps", "r_max", "negotiate_timeout_ms", "delta")},
+                   "warm_start": {k.split("/")[1]: v for k, v in (row["warm"] or {}).items()} or None},
+        "declared": declared,
+        "region": region, "relaxed": relaxed, "feasible_points": points,
+        "messages": msgs,
+        "result": {"rounds": res.rounds, "duration_ms": round(res.duration_ms, 1),
+                   "aborted": res.aborted, "abort_reason": res.abort_reason,
+                   "messages": res.messages,
+                   "transcript_hash": res.transcript_hash[:16] if res.transcript_hash else None},
+        "contract": None if not c else {
+            "contract_id": c["contract_id"],
+            "agreed": {k.split("/")[1]: v for k, v in c["agreed"].items()},
+            "authority": {k.split("/")[1]: v for k, v in c["authority_map"].items()},
+            "resolved_by": c["provenance"]["resolved_by"],
+            "signatures": sorted(c["signatures"]),
+            "warm_started": c.get("warm_started", False),
+            "u_a": round(utility(cfg_a, c["agreed"], box, wa), 3),
+            "u_b": round(utility(cfg_b, c["agreed"], box, wb), 3),
+            # The enforcement guard, re-run here so the panel proves it rather
+            # than asserting it: no fabric insight can talk either agent out of
+            # a constraint it declared.
+            "enforced": {cfg_a.agent_id: hard_ok(cfg_a, c["agreed"]),
+                         cfg_b.agent_id: hard_ok(cfg_b, c["agreed"])},
+        },
+    }
+
+
 def fabric_event(mesh) -> dict:
     """A snapshot of every replica: what the UI's node columns render."""
     nodes = {}
@@ -136,10 +244,18 @@ def fabric_event(mesh) -> dict:
 
 
 def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
-        pace: float = 0.0, analyzer: str = "rules", on_event=None, on_record=None) -> tuple:
+        pace: float = 0.0, analyzer: str = "rules", on_event=None, on_record=None,
+        on_row=None, gate=None) -> tuple:
     """Run the 30-task flow. `on_event(dict)` receives structured beats -- the same
     ones the narration prints -- so the live UI renders this exact code path rather
-    than a parallel one built to look like it. `on_record` forwards raw telemetry."""
+    than a parallel one built to look like it. `on_record` forwards raw telemetry.
+
+    `on_row(row)` hands over the full row (including the signed transcript) so a
+    caller can offer a per-task drill-down; it is not streamed, because 30 full
+    transcripts is a lot of bytes to push at a browser that may never ask.
+    `gate(idx)` is called before each task and may block -- that is single-step
+    mode. Neither can change what happens: they observe and they wait.
+    """
     emit = on_event or (lambda _e: None)
 
     def _log(*a) -> None:
@@ -173,8 +289,12 @@ def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
                       f"{SLO_CONTRACT_DURATION_MS}ms | abort rate <= {SLO_ABORT_RATE:.0%} "
                       f"| window {SLO_WINDOW} tasks{C['x']}\n")
 
+        if gate:
+            gate(t.idx)
         r = mesh.run_task(t)
         rows.append(r)
+        if on_row:
+            on_row(r)
         note = ""
 
         res = r["result"]
@@ -204,8 +324,13 @@ def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
 
         if not quiet:
             print(task_line(r, note))
-            if pace:
-                time.sleep(pace)
+        # Pacing is presentation, never physics: every number comes off the virtual
+        # clock and does not move when you slow the narration down. This sleep sits
+        # OUTSIDE the `quiet` guard on purpose -- the UI runs quiet, so with it
+        # inside, the pace control silently did nothing and a 30-task run flashed
+        # past in well under a second with no way to watch anything happen.
+        if pace:
+            time.sleep(pace)
 
         emit(fabric_event(mesh))
 

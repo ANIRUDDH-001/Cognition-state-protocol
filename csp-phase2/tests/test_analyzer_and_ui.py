@@ -229,3 +229,107 @@ def test_ui_server_imports_without_a_running_loop():
     """A broken import is a black screen in front of judges."""
     from ui import server
     assert server.app is not None and callable(server.hub.publish)
+
+
+# --- per-task drill-down + step gate -------------------------------------------
+
+
+def test_task_detail_reconstructs_the_whole_handshake_from_a_row(tmp_path):
+    """The UI's task click. Feasibility is recomputed from the two declarations
+    rather than logged during the run, so it cannot drift from what the engine
+    did -- but that only holds if it reconstructs the SAME negotiation."""
+    from demo.run_demo import run, task_detail
+
+    rows = []
+    run(42, True, quiet=True, out_dir=str(tmp_path), on_row=rows.append)
+    assert len(rows) == 30
+
+    d = task_detail(rows[0])
+    assert [a["agent"] for a in d["declared"]] == ["N1.throughput", "N2.security"]
+    assert d["relaxed"] == [] and d["feasible_points"] > 0
+    # The declared region must be the one the personas actually imply.
+    dom = {r["dim"]: r["domain"] for r in d["region"]}
+    assert dom["tls_version"] == "{1.3}" and dom["log_export"] == "{True}"
+    assert dom["inspection_depth"] == "{selective_deep, full_deep}"
+
+    # Every signed envelope, in order, with utilities recomputed from public info.
+    assert len(d["messages"]) == rows[0]["result"].messages
+    assert d["messages"][0]["type"] == "INTENT_DECLARE"
+    offers = [m for m in d["messages"] if "point" in m]
+    assert offers and all(0.0 <= m["u_a"] <= 1.0 and 0.0 <= m["u_b"] <= 1.0 for m in offers)
+    assert all(m["sig"] for m in d["messages"]), "every envelope is signed"
+
+    c = d["contract"]
+    assert c and c["contract_id"] == rows[0]["result"].contract["contract_id"]
+    assert all(c["enforced"].values()), "the enforcement guard must re-pass here"
+
+
+def test_task_detail_shows_the_reuse_on_the_cross_node_task(tmp_path):
+    """Task 25 is the one a judge will click: N3 opening on N1's remembered point."""
+    from demo.run_demo import run, task_detail
+
+    rows = []
+    run(42, True, quiet=True, out_dir=str(tmp_path), on_row=rows.append)
+    d = task_detail(rows[24])  # task 25
+
+    assert d["idx"] == 25 and d["pair"] == "N3xN2" and d["era"] == "act3-crossnode"
+    assert d["config"]["epoch"] == 1 and d["config"]["insight_ids"], "must be applying an insight"
+    assert d["config"]["warm_start"], "the remembered settlement must be visible"
+    assert d["contract"]["warm_started"] is True
+    assert d["result"]["rounds"] == 1, "the whole point: one round"
+    # The opening PROPOSE should already be at the remembered point.
+    first = next(m for m in d["messages"] if m["type"] == "PROPOSE")
+    assert first["point"] == d["config"]["warm_start"]
+
+
+def test_task_detail_survives_an_aborted_task(tmp_path):
+    """Aborted tasks have no contract. The panel must render them, not throw --
+    tasks 10/12/13 abort on seed 42 and they are IN the clickable stream."""
+    from demo.run_demo import run, task_detail
+
+    rows = []
+    run(42, True, quiet=True, out_dir=str(tmp_path), on_row=rows.append)
+    aborted = [r for r in rows if r["result"].aborted]
+    assert aborted, "seed 42 must still produce cold-era timeouts"
+    d = task_detail(aborted[0])
+    assert d["contract"] is None
+    assert d["result"]["aborted"] and d["result"]["abort_reason"] == "TIMEOUT"
+    assert d["declared"] and d["region"], "intent and region exist even without a contract"
+
+
+def test_task_detail_is_json_safe(tmp_path):
+    """It goes over HTTP. A set or a dataclass in here is a 500 mid-demo."""
+    import json as _json
+    from demo.run_demo import run, task_detail
+
+    rows = []
+    run(42, True, quiet=True, out_dir=str(tmp_path), on_row=rows.append)
+    for r in (rows[0], rows[24]):
+        _json.dumps(task_detail(r))  # raises on anything unserialisable
+
+
+def test_the_gate_can_single_step_and_cannot_change_the_outcome(tmp_path):
+    """Step mode is presentation. Gating every task must not move a single number."""
+    from demo.run_demo import run, summarize
+
+    a_mesh, a_rows, _ = run(42, True, quiet=True, out_dir=str(tmp_path / "free"))
+
+    seen = []
+    b_mesh, b_rows, _ = run(42, True, quiet=True, out_dir=str(tmp_path / "gated"),
+                            gate=seen.append)
+    assert seen == list(range(1, 31)), "the gate must be offered every task, in order"
+    assert summarize(a_mesh, a_rows) == summarize(b_mesh, b_rows)
+    assert [r["result"].transcript_hash for r in a_rows] == \
+           [r["result"].transcript_hash for r in b_rows]
+
+
+def test_pace_is_honoured_even_when_quiet(monkeypatch, tmp_path):
+    """The UI runs quiet. With the sleep inside the `not quiet` guard the pace
+    control silently did nothing and a 30-task run flashed past in under a second.
+    """
+    from demo import run_demo
+
+    slept = []
+    monkeypatch.setattr(run_demo.time, "sleep", lambda s: slept.append(s))
+    run_demo.run(42, True, quiet=True, out_dir=str(tmp_path), pace=0.25)
+    assert len(slept) == 30 and all(s == 0.25 for s in slept)

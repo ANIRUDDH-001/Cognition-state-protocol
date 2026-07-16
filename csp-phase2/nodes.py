@@ -150,7 +150,11 @@ class Mesh:
         self._probation_tick(na, ids, res)
 
         return {"task": task, "result": res, "incident": incident, "params": params,
-                "warm": warm, "insight_ids": ids, "epoch": epoch, "node": a_node, "peer": b_node}
+                "warm": warm, "insight_ids": ids, "epoch": epoch, "node": a_node, "peer": b_node,
+                # The two personas that negotiated. Carried so a reader can
+                # reconstruct the handshake -- declared intent, the intersection,
+                # every offer -- from the row alone (demo.run_demo.task_detail).
+                "cfg_a": cfg_a, "cfg_b": cfg_b}
 
     # --- the accelerator ------------------------------------------------------
 
