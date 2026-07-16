@@ -85,24 +85,45 @@ class Telemetry:
         return list(self.by_session.get(session, []))
 
 
+def scope_ctx(task_ctx: dict) -> dict:
+    """The context an incident -- and therefore an insight -- is scoped to."""
+    return {"link_quality": task_ctx.get("link_quality")}
+
+
 class SLOEvaluator:
-    """Rolling-window SLO checks. on_task_end -> Incident | None."""
+    """Rolling-window SLO checks, evaluated PER CONTEXT. on_task_end -> Incident | None.
+
+    Windows are keyed by the same context an insight is scoped to: we detect in
+    the scope we remember in. A single global window silently mixes conditions --
+    a healthy 60 ms task arriving right after a lossy era inherits the era's p95,
+    fires a bogus incident, and mints an insight scoped to `normal` built on
+    `lossy` evidence. Slicing by context is also just what you would do in
+    production: you do not alert on one p95 across every route.
+    """
 
     def __init__(self, telemetry: Telemetry, window: int = SLO_WINDOW):
         self.tel = telemetry
         self.window = window
-        self.latencies: deque = deque(maxlen=window * 40)
-        self.durations: deque = deque(maxlen=window)
-        self.aborts: deque = deque(maxlen=window)
+        self.win: dict = {}
         self._n = 0
+
+    def _window_for(self, ctx: dict) -> dict:
+        key = repr(sorted(scope_ctx(ctx).items()))
+        if key not in self.win:
+            self.win[key] = {"lat": deque(maxlen=self.window),
+                             "dur": deque(maxlen=self.window),
+                             "ab": deque(maxlen=self.window)}
+        return self.win[key]
 
     def on_task_end(self, node: str, task_ctx: dict, result, session: str,
                     scenario: dict) -> Incident | None:
         self._n += 1
+        w = self._window_for(task_ctx)
         lats = self.tel.session_latencies(session)
-        self.latencies.extend(lats)
-        self.durations.append(result.duration_ms)
-        self.aborts.append(1 if result.aborted else 0)
+        # One entry per task, not per message: the window is 5 TASKS wide.
+        w["lat"].append(lats)
+        w["dur"].append(result.duration_ms)
+        w["ab"].append(1 if result.aborted else 0)
 
         self.tel.metric("csp.contract.duration_ms", result.duration_ms,
                         {"node": node, "session": session, **_ctx_attrs(task_ctx)})
@@ -112,14 +133,15 @@ class SLOEvaluator:
             self.tel.count("csp.abort.count",
                            {"node": node, "reason": result.abort_reason, **_ctx_attrs(task_ctx)})
 
-        if len(self.durations) < self.window:
+        if len(w["dur"]) < self.window:
             return None  # never fire on a window we have not filled
 
-        lat_p95 = p95(list(self.latencies))
-        dur_p95 = p95(list(self.durations))
-        abort_rate = sum(self.aborts) / len(self.aborts)
+        flat = [x for lst in w["lat"] for x in lst]
+        lat_p95 = p95(flat)
+        dur_p95 = p95(list(w["dur"]))
+        abort_rate = sum(w["ab"]) / len(w["ab"])
 
-        stats = {"p95": lat_p95, "n": len(self.latencies),
+        stats = {"p95": lat_p95, "n": len(flat),
                  "duration_p95": dur_p95, "abort_rate": abort_rate,
                  "window": self.window}
 
@@ -149,7 +171,9 @@ class SLOEvaluator:
         ]
 
         inc = Incident(
-            id=f"inc-{self._n:02d}",
+            # Node-qualified: each node runs its own evaluator, so a bare counter
+            # collides across nodes.
+            id=f"inc-{node}-{self._n:02d}",
             breached_slo=breach,
             window_stats=stats,
             worst_spans=worst_spans,

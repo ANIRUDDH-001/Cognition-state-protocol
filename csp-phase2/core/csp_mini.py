@@ -33,6 +33,7 @@ correctness (Doc 4 §1, invariant 4).
 """
 from __future__ import annotations
 
+import copy
 import itertools
 import random
 from dataclasses import asdict, dataclass, field
@@ -471,7 +472,11 @@ def negotiate(
             "to": to,
             "ts_ms": bus.clock.now(),
             "nonce": _nonce(bus.rng),
-            "payload": payload,
+            # Deep copy: an envelope is immutable the instant it is signed. The
+            # contract keeps being countersigned after COMMIT goes out, and
+            # without this the sender mutates a payload it has already signed --
+            # the envelope then fails verification at the receiver.
+            "payload": copy.deepcopy(payload),
         }
         env = sign_envelope(identities[frm], env)
         transcript.append(env)
@@ -498,6 +503,12 @@ def negotiate(
                 raise _Abort("SCHEMA_MISMATCH")
             if not verify_envelope(keyring, env):
                 raise _Abort("INVALID_SIG")
+            if env.get("session") != session:
+                # A dead envelope from an earlier session on the same channel.
+                # `session` is constant within a session (Doc 2 §4), so anything
+                # else is not ours: discard it rather than parse it as our next
+                # expected message.
+                continue
             key = (env["from"], env["seq"])
             if key in seen[agent]:
                 continue  # replay guard: duplicates are idempotent drops
@@ -634,6 +645,12 @@ def negotiate(
             send(cur, other, MSG_COUNTER, {"round": rounds, "point": F[my]})
             prev_offer[cur] = my
             cur, other = other, cur
+
+        # `cur` has just sent ACCEPT or SETTLE. `other` must actually consume it:
+        # leaving it queued desynchronises the channel, and the COMMIT below gets
+        # dequeued in its place.
+        if recv(other) is None:
+            return result(None, rounds, True, "TIMEOUT")
 
         agreed = F[agreed_idx]
 
