@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cognition Fabric — live</title>
+<style>
+  /* No CDN, no chart library, no webfont. Assume the venue wifi is hostile. */
+  :root{
+    --bg:#0e1117; --panel:#161b22; --line:#262d38;
+    --ink:#e6edf3; --dim:#8b949e; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+    --on:#58a6ff; --off:#6e7681; --mg:#bc8cff; --cy:#39c5cf;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+         padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line);
+         position:sticky;top:0;z-index:5}
+  h1{font-size:14px;margin:0;letter-spacing:.4px}
+  h1 small{color:var(--dim);font-weight:400;margin-left:8px}
+  .spacer{flex:1}
+  button{background:#21262d;color:var(--ink);border:1px solid #30363d;border-radius:6px;
+         padding:5px 11px;cursor:pointer;font:inherit}
+  button:hover:not(:disabled){border-color:var(--on)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.go{background:var(--on);color:#07121f;border-color:var(--on);font-weight:600}
+  button.chaos{border-color:#5a2f2f}
+  button.chaos:hover:not(:disabled){border-color:var(--bad)}
+  select,input{background:#0d1117;color:var(--ink);border:1px solid #30363d;
+               border-radius:6px;padding:4px 6px;font:inherit}
+  label{color:var(--dim)}
+  .grid{display:grid;gap:10px;padding:10px;
+        grid-template-columns:minmax(340px,1.15fr) minmax(320px,1fr);}
+  @media(max-width:1000px){.grid{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+         display:flex;flex-direction:column;min-height:0}
+  .panel > h2{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);
+              margin:0;padding:8px 11px;border-bottom:1px solid var(--line);font-weight:600}
+  .body{padding:9px 11px;overflow:auto}
+  .scroll{max-height:300px}
+  /* pre-wrap, not pre: the "N3 reuses N1's insight" note is the single most
+     important sentence on screen and must never be clipped off the right edge. */
+  .row{white-space:pre-wrap;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+  .dim{color:var(--dim)} .ok{color:var(--ok)} .bad{color:var(--bad)}
+  .warn{color:var(--warn)} .mg{color:var(--mg)} .cy{color:var(--cy)} .b{font-weight:700}
+  .badge{display:inline-block;padding:0 6px;border-radius:9px;font-size:10px;
+         border:1px solid currentColor}
+  .nodes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .node{border:1px solid var(--line);border-radius:6px;padding:7px 8px;background:#0d1117}
+  .node.down{opacity:.42;border-color:var(--bad)}
+  .node h3{margin:0 0 5px;font-size:12px}
+  .bars{display:flex;align-items:flex-end;gap:2px;height:74px}
+  .bar{flex:1;min-width:3px;background:var(--off);border-radius:2px 2px 0 0;position:relative}
+  .bar.on{background:var(--on)}
+  .bar.ab{background:var(--bad)}
+  .legend{display:flex;gap:14px;margin-top:6px;color:var(--dim);font-size:11px;align-items:center}
+  .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
+  table{border-collapse:collapse;width:100%;font-size:12px}
+  th,td{text-align:left;padding:3px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600}
+  .step{display:flex;gap:8px;align-items:baseline;padding:2px 0}
+  .step .k{color:var(--dim);min-width:96px}
+  #stream .row:first-child{background:#1f6feb22}
+  .hint{color:var(--dim);font-size:11px;padding:6px 11px;border-top:1px solid var(--line)}
+  .pill{border-radius:9px;padding:0 7px;font-size:11px;background:#21262d;border:1px solid #30363d}
+</style>
+</head>
+<body>
+<header>
+  <h1>COGNITION FABRIC <small>Phase 2 — The Continuous Mesh &amp; The Ratchet Effect</small></h1>
+  <span class="pill" id="status">idle</span>
+  <div class="spacer"></div>
+  <label>seed <input id="seed" type="number" value="42" style="width:62px"></label>
+  <label>analyzer
+    <select id="analyzer"><option value="rules">rules</option><option value="gemini">gemini</option></select>
+  </label>
+  <label>pace
+    <select id="pace">
+      <option value="0.25">0.25s</option><option value="0.1">0.1s</option>
+      <option value="0.6">0.6s</option><option value="0">full speed</option>
+    </select>
+  </label>
+  <button class="go" id="run">▶ Run 30 tasks</button>
+  <button class="chaos" id="f1" disabled>F1 node down</button>
+  <button class="chaos" id="f2" disabled>F2 poison ×4</button>
+  <button class="chaos" id="f3" disabled>F3 partition</button>
+</header>
+
+<div class="grid">
+  <section class="panel">
+    <h2>Task stream — 30 enterprise tasks, conditions change underneath the agents</h2>
+    <div class="body scroll" id="stream" style="max-height:330px"></div>
+    <div class="hint" id="ratchet-note"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Fabric replicas — the digest is what must converge</h2>
+    <div class="body"><div class="nodes" id="nodes"></div></div>
+    <div class="hint">Chain heads differ by design: they record the order each node
+      <b>learned</b> things. The digest over the signed entry set is what converges.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Insight lifecycle — a breakthrough is a claim with reproducible evidence</h2>
+    <div class="body" id="pipeline"><span class="dim">waiting for an SLO breach…</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Guardrail &amp; chaos — every poisoned update, and what stopped it</h2>
+    <div class="body scroll" id="guardrail"><span class="dim">no denials yet</span></div>
+  </section>
+
+  <section class="panel" style="grid-column:1/-1">
+    <h2>Negotiation rounds per task — this is what the fabric actually removes</h2>
+    <div class="body">
+      <div class="bars" id="bars"></div>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--off)"></i>fabric OFF (baseline, same seed)</span>
+        <span><i class="sw" style="background:var(--on)"></i>fabric ON</span>
+        <span><i class="sw" style="background:var(--bad)"></i>timed out — no contract at all</span>
+        <span class="dim" id="bars-note"></span>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const pad = (v,n) => String(v).padStart(n);
+
+let baseline = {};    // task idx -> baseline row
+let onRounds = {};    // task idx -> live row
+let denies = [];
+let running = false;
+
+function setRunning(v){
+  running = v;
+  $("run").disabled = v;
+  $("status").textContent = v ? "running" : "idle";
+  $("status").style.color = v ? "var(--warn)" : "var(--dim)";
+}
+function enableChaos(v){ for(const f of ["f1","f2","f3"]) $(f).disabled = !v; }
+
+/* ---- task stream ---- */
+function addTask(e){
+  onRounds[e.idx] = e;
+  if(!e.fabric_on) return;              // baseline runs quiet; it only feeds the bars
+  const d = document.createElement("div");
+  d.className = "row";
+  const lq = e.link_quality === "lossy"
+    ? `<span class="warn">[lossy ]</span>` : `<span class="dim">[normal]</span>`;
+  const out = e.aborted
+    ? `<span class="bad">ABORT(${esc(e.abort_reason)})</span>`
+    : `rounds=${e.rounds} dur=<span class="${e.duration_ms>5000?"bad":"ok"}">${pad(Math.round(e.duration_ms),6)}ms</span>`;
+  const ins = (e.insight_ids||[]).map(i=>i.replace("ins-","")).join(",");
+  let note = "";
+  if(e.warm && e.rounds === 1) note = ` <span class="cy">(warm-start)</span>`;
+  if(e.era === "act3-normal" && !(e.insight_ids||[]).length)
+    note += ` <span class="mg">← lossy insight NOT applied: different context</span>`;
+  if(e.era === "act3-crossnode" && (e.insight_ids||[]).length)
+    note += ` <span class="ok">← N3 reuses N1's insight — it never saw the incident</span>`;
+  d.innerHTML = `task ${pad(e.idx,2)} ${lq} ${esc(e.node)}×${esc(e.peer)} ${out} `
+              + `epoch=${e.epoch} insights=[${esc(ins)}]${note}`;
+  $("stream").prepend(d);
+  drawBars();
+}
+
+/* ---- rounds bars ---- */
+function drawBars(){
+  const idxs = [...new Set([...Object.keys(baseline), ...Object.keys(onRounds)])]
+    .map(Number).sort((a,b)=>a-b);
+  const max = 8;
+  $("bars").innerHTML = idxs.map(i=>{
+    const b = baseline[i], o = onRounds[i];
+    const h = r => Math.max(4, Math.round((Math.min(r?.rounds ?? 0, max)/max)*70));
+    const cell = (r,cls) => r
+      ? `<div class="bar ${r.aborted?"ab":cls}" style="height:${h(r)}px"
+             title="task ${i} ${cls==="on"?"fabric ON":"baseline"}: rounds=${r.rounds}${r.aborted?" (TIMED OUT)":""}"></div>`
+      : `<div class="bar" style="height:2px;background:transparent"></div>`;
+    return `<div style="flex:1;display:flex;gap:1px;align-items:flex-end">
+              ${cell(b,"off")}${cell(o,"on")}</div>`;
+  }).join("");
+
+  // Must match demo/run_demo.summarize() EXACTLY: mean rounds over lossy tasks,
+  // EXCLUDING aborted ones -- an abort has no meaningful round count. The UI and the
+  // terminal reporting different numbers for the same run is a demo-losing bug.
+  // (link_quality lives on the fabric-on rows; the baseline is the same seed and
+  // therefore the same eras, so index them by the same task ids.)
+  const lossy = i => onRounds[i]?.link_quality === "lossy";
+  const mean = o => { const v = Object.keys(o).filter(lossy)
+                        .map(i=>o[i]).filter(r=>r && !r.aborted && typeof r.rounds === "number")
+                        .map(r=>r.rounds);
+                      return v.length ? v.reduce((a,b)=>a+b,0)/v.length : 0; };
+  const mb = mean(baseline), mo = mean(onRounds);
+  if(mb && mo){
+    const pct = Math.round((mo/mb-1)*100);
+    $("bars-note").textContent = `lossy-task mean rounds: ${mb.toFixed(2)} → ${mo.toFixed(2)} (${pct}%)`;
+    $("ratchet-note").innerHTML = `Rounds is the honest headline — it is exactly what the `
+      + `remembered settlement removes. <span class="ok">${mb.toFixed(2)} → ${mo.toFixed(2)}`
+      + ` (${pct}%)</span> on lossy tasks, same seed.`;
+  }
+}
+
+/* ---- fabric replicas ---- */
+function drawFabric(e){
+  $("nodes").innerHTML = Object.entries(e.nodes).map(([n,v])=>{
+    const badge = s => ({VERIFIED:"ok",QUARANTINED:"bad",REVOKED:"mg",
+                         CANDIDATE:"warn",LOCAL:"dim"}[s] || "dim");
+    const list = v.insights.length ? v.insights.map(i=>
+      `<div class="row" style="font-size:11px">
+         <span class="badge ${badge(i.status)}">${esc(i.status)}</span>
+         ${esc(i.id.replace("ins-",""))}
+         <span class="dim">${esc(i.scope.link_quality||"*")}·${esc(i.discovered_by)}</span>
+       </div>`).join("") : `<div class="dim" style="font-size:11px">—</div>`;
+    return `<div class="node ${v.down?"down":""}">
+      <h3>${esc(n)} ${v.down?'<span class="bad">DOWN</span>':""}</h3>
+      <div class="dim" style="font-size:11px">chain idx=${v.chain_idx}</div>
+      <div class="dim" style="font-size:11px">digest ${esc(v.digest)}…</div>
+      <div style="margin-top:6px">${list}</div></div>`;
+  }).join("");
+  const s = $("status");
+  if(!running) s.textContent = e.converged ? "idle · converged ✔" : "idle · DIVERGED";
+  if(e.denies?.length){ denies = e.denies; drawGuardrail(); }
+}
+
+/* ---- insight lifecycle ---- */
+function drawPipeline(e){
+  if(!e.id){
+    if(e.denied) $("pipeline").innerHTML =
+      `<div class="bad">draft DENIED at our own guardrail: ${esc(e.denied.reason)}</div>
+       <div class="dim">${esc(e.denied.detail)}</div>`;
+    return;
+  }
+  const atts = e.attestations.map(a=>
+    `<div class="step"><span class="k">ATTEST ${esc(a.node)}</span>
+       <span class="${a.ok?"ok":"bad"}">${a.ok?"✔":"✗"}</span>
+       <span class="dim">${esc(a.ok ? a.replay_hash : (a.reason||a.stage))}</span></div>`).join("");
+  const verified = e.status === "VERIFIED";
+  $("pipeline").innerHTML = `
+    <div class="step"><span class="k b">ANALYZER</span>
+      <span>${esc(e.analyzer)} on ${esc(e.discovered_by)} — drafts a hypothesis</span></div>
+    ${e.hypothesis?`<div class="dim" style="margin:0 0 4px 104px">${esc(e.hypothesis)}</div>`:""}
+    <div class="step"><span class="k">cited spans</span>
+      <span class="dim">${esc((e.cited_span_ids||[]).join(", ")||"—")}</span></div>
+    <div class="step"><span class="k">claim.params</span>
+      <span class="cy">${esc(JSON.stringify(e.claim.params||{}))}</span></div>
+    <div class="step"><span class="k">warm_start</span>
+      <span class="dim">${e.claim.warm_start?"yes — the settlement we already know here":"no"}</span></div>
+    <div class="step"><span class="k b">GUARDRAIL</span><span class="ok">ALLOW</span>
+      <span class="dim">signed · whitelisted · in bounds · above the policy floor</span></div>
+    <div class="step"><span class="k b">PEER REPLAY</span>
+      <span class="dim">as re-measured by ${esc(e.measured_by||"—")}, not as claimed</span></div>
+    <div class="step"><span class="k">before</span>
+      <span>rounds=${e.before.rounds} dur=${Math.round(e.before.duration_ms)}ms
+      aborted=${e.before.aborted}</span></div>
+    <div class="step"><span class="k">after</span>
+      <span>rounds=${e.after.rounds} dur=${Math.round(e.after.duration_ms)}ms
+      aborted=${e.after.aborted}</span></div>
+    ${atts}
+    <div class="step"><span class="k b">STATUS</span>
+      <span class="${verified?"ok b":"warn b"}">${esc(e.status)} ${esc(e.id)}</span></div>
+    ${verified?`<div class="dim" style="margin-left:104px">two independent nodes produced the
+      SAME replay hash — agreeing <b>evidence</b>, not agreeing opinions</div>`:""}`;
+}
+
+/* ---- guardrail + chaos table ---- */
+function drawGuardrail(rows){
+  const t = [];
+  if(denies.length){
+    t.push(`<table><tr><th>node</th><th>reason</th><th>insight</th></tr>` +
+      denies.map(d=>`<tr><td>${esc(d.node)}</td><td class="bad">${esc(d.reason)}</td>
+        <td class="dim">${esc((d.insight_id||"").replace("ins-",""))}</td></tr>`).join("") +
+      `</table>`);
+  }
+  if(rows) t.push(rows);
+  $("guardrail").innerHTML = t.join("") || `<span class="dim">no denials yet</span>`;
+}
+
+function drawChaos(e){
+  const r = e.report || {};
+  let html = `<div class="b" style="margin:8px 0 4px">${esc(r.fault||e.fault)}</div>`;
+  if(r.rows){
+    html += `<table><tr><th>#</th><th>attack</th><th>expected</th><th>caught at</th>
+             <th>outcome</th></tr>` + r.rows.map(x=>
+      `<tr><td>${esc(x.tag)}</td><td>${esc(x.desc)}</td><td class="dim">${esc(x.expected)}</td>
+       <td class="warn">${esc(x.stage)}</td>
+       <td class="${x.blocked?"ok":"bad"}">${esc(x.status)}</td></tr>`).join("") + `</table>`;
+    html += `<div class="dim" style="margin-top:5px">(d) is the one that matters: valid
+      signature, in-bounds params, confident numbers. It passed every guardrail and died
+      because <b>two peers replayed it and the numbers were not real</b>.</div>`;
+  }
+  if(r.detect) html += `<div class="dim">DETECT ${esc(JSON.stringify(r.detect))}</div>`;
+  if(r.repair) html += `<div class="dim">REPAIR ${esc(JSON.stringify(r.repair))}</div>`;
+  if(r.integrity) html += `<div>INTEGRITY converged=<span class="${
+    r.integrity.converged?"ok":"bad"}">${r.integrity.converged}</span>
+    chains_valid=<span class="ok">${r.integrity.chains_valid}</span></div>`;
+  drawGuardrail(html);
+}
+
+/* ---- wire ---- */
+const handlers = {
+  run_start: e => { if(e.fabric_on){ $("stream").innerHTML=""; onRounds={}; setRunning(true);} },
+  baseline: e => { baseline = {}; e.rounds.forEach(r => baseline[r.idx] = r); drawBars(); },
+  task: addTask,
+  fabric: drawFabric,
+  pipeline: drawPipeline,
+  chaos: drawChaos,
+  incident: e => { $("pipeline").innerHTML =
+      `<div class="bad b">INCIDENT ${esc(e.id)} — ${esc(e.breached_slo)} p95 =
+       ${Math.round(e.p95)}ms &gt; SLO ${esc(e.threshold)}ms</div>
+       <div class="dim">analyzer is drafting…</div>`; },
+  run_end: () => { setRunning(false); enableChaos(true); },
+  idle: () => setRunning(false),
+  error: e => { $("status").textContent = "error"; $("status").style.color="var(--bad)";
+                console.error(e.detail); alert("run failed: " + e.detail); },
+};
+
+function connect(){
+  const ws = new WebSocket(`ws://${location.host}/stream`);
+  ws.onmessage = m => { const e = JSON.parse(m.data); (handlers[e.type] || (()=>{}))(e); };
+  ws.onclose = () => setTimeout(connect, 800);   // survive a server restart mid-demo
+}
+connect();
+
+$("run").onclick = async () => {
+  enableChaos(false);
+  const q = new URLSearchParams({seed:$("seed").value, fabric:"on",
+                                analyzer:$("analyzer").value, pace:$("pace").value});
+  const r = await fetch("/run?"+q, {method:"POST"});
+  if(!r.ok) alert((await r.json()).detail);
+};
+for(const f of ["f1","f2","f3"]) $(f).onclick = async () => {
+  const r = await fetch("/chaos/"+f, {method:"POST"});
+  if(!r.ok) alert((await r.json()).detail);
+};
+</script>
+</body>
+</html>

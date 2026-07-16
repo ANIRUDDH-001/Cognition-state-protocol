@@ -37,6 +37,7 @@ from core.types import (
     STATUS_REVOKED,
     STATUS_VERIFIED,
 )
+from fabric.model import compute_id
 
 KIND_INSIGHT = "INSIGHT"
 KIND_ATTEST = "ATTEST"
@@ -45,6 +46,48 @@ KIND_GUARDRAIL_DENY = "GUARDRAIL_DENY"
 KIND_TOMBSTONE = "TOMBSTONE"
 
 QUORUM = 2  # 2-of-3 distinct attesting nodes
+
+_INSIGHT_FIELDS = ("id", "version", "scope", "claim", "evidence", "provenance")
+
+
+def valid_body(kind: str, body) -> bool:
+    """Schema gate at the log boundary. An entry whose signature verifies is
+    authentic, not well-formed: a pinned-but-compromised node can sign anything.
+    Everything downstream (fold, guardrail, pipeline) indexes into these shapes,
+    so a body that does not match one is refused here rather than raising deep
+    inside a fold that every node runs. Fail closed (Doc 1 §2.3).
+
+    The id check is the load-bearing one. `id` is excluded from the signed body
+    (fabric/model.signing_body) precisely because it is derived from it -- so an
+    author can name its insight anything unless we re-derive and compare. Without
+    this, a rogue node can publish a poisoned body carrying an already-VERIFIED
+    insight's id and inherit that insight's attestations wholesale, since the
+    fold keys attestations by id.
+    """
+    if not isinstance(body, dict):
+        return False
+    if kind == KIND_INSIGHT:
+        ins = body.get("insight")
+        if not isinstance(ins, dict) or not all(k in ins for k in _INSIGHT_FIELDS):
+            return False
+        if not isinstance(ins["provenance"], dict):
+            return False
+        try:
+            return compute_id(ins) == ins["id"]
+        except (KeyError, TypeError, ValueError):
+            return False
+    if kind == KIND_ATTEST:
+        return (isinstance(body.get("insight_id"), str)
+                and isinstance(body.get("ok"), bool)
+                and isinstance(body.get("replay_hash"), str))
+    if kind == KIND_STATUS:
+        return (isinstance(body.get("insight_id"), str)
+                and body.get("status") in STATUS_RANK)
+    if kind == KIND_TOMBSTONE:
+        return isinstance(body.get("insight_id"), str)
+    if kind == KIND_GUARDRAIL_DENY:
+        return isinstance(body.get("insight_id"), str) and isinstance(body.get("reason"), str)
+    return False  # unknown kinds are not a thing we replicate
 
 
 class FabricLog:
@@ -65,6 +108,25 @@ class FabricLog:
 
     def append(self, kind: str, body: dict) -> dict:
         """Author a new entry locally and sign it."""
+        if not valid_body(kind, body):
+            raise ValueError(f"refusing to author a malformed {kind} entry")
+        content = {"author": self.node_id, "kind": kind, "seq": self._seq, "body": body}
+        self._seq += 1
+        entry = dict(content)
+        entry["entry_id"] = sha256_hex(canonical(content))
+        entry["sig"] = self.identity.sign(canonical(content))
+        self._add(entry)
+        return entry
+
+    def force_append(self, kind: str, body: dict) -> dict:
+        """Author an entry WITHOUT the local schema gate.
+
+        Chaos only. A compromised node does not run our validation before
+        broadcasting -- assuming it does would make the guardrail look good by
+        assuming away the attacker. This models the rogue's own log; every honest
+        peer still puts the result through ingest(), which is where the claim
+        that matters ("no node trusts an entry because of who sent it") is tested.
+        """
         content = {"author": self.node_id, "kind": kind, "seq": self._seq, "body": body}
         self._seq += 1
         entry = dict(content)
@@ -83,6 +145,8 @@ class FabricLog:
             return False  # id must bind the content
         if not self.keyring.verify(entry["author"], entry.get("sig", ""), canonical(content)):
             return False  # unpinned author or bad signature
+        if not valid_body(entry["kind"], entry["body"]):
+            return False  # authentic but malformed -- a signature is not a schema
         if entry["entry_id"] in self.by_id:
             return False  # idempotent: union of a set
         self._add(entry)
@@ -133,8 +197,13 @@ class FabricLog:
         """Rebuild current state from the entry set. Order-independent."""
         insights: dict[str, dict] = {}
         attests: dict[str, dict] = defaultdict(dict)  # id -> author -> attestation
-        explicit: dict[str, int] = defaultdict(lambda: 0)
-        reasons: dict[str, str] = {}
+        # iid -> status -> {authors who voted for it}. Demotion is a VOTE, not a
+        # command: an explicit status only binds the fabric at QUORUM, exactly like
+        # promotion. One pinned-but-compromised node signing STATUS:REVOKED for
+        # every id would otherwise reset the collective memory to zero on its own
+        # -- the precise outcome the pruning design is supposed to rule out.
+        votes: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
+        reasons: dict[str, dict[str, str]] = defaultdict(dict)
         denies: list = []
 
         for entry in sorted(self.by_id.values(), key=lambda e: (e["author"], e["seq"])):
@@ -150,15 +219,21 @@ class FabricLog:
                     "replay_hash": body["replay_hash"],
                 }
             elif kind == KIND_STATUS:
-                r = STATUS_RANK.get(body["status"], 0)
-                if r >= explicit[body["insight_id"]]:
-                    explicit[body["insight_id"]] = r
-                    reasons[body["insight_id"]] = body.get("reason", "")
+                votes[body["insight_id"]][body["status"]].add(author)
+                reasons[body["insight_id"]][body["status"]] = body.get("reason", "")
             elif kind == KIND_TOMBSTONE:
-                explicit[body["insight_id"]] = STATUS_RANK[STATUS_REVOKED]
-                reasons[body["insight_id"]] = body.get("reason", "tombstoned")
+                votes[body["insight_id"]][STATUS_REVOKED].add(author)
+                reasons[body["insight_id"]][STATUS_REVOKED] = body.get("reason", "tombstoned")
             elif kind == KIND_GUARDRAIL_DENY:
                 denies.append({"node": author, **body})
+
+        def explicit_for(iid: str) -> tuple:
+            """Highest status that reached quorum, with the reason its voters gave."""
+            rank, reason = 0, ""
+            for status, authors in votes[iid].items():
+                if len(authors) >= QUORUM and STATUS_RANK[status] > rank:
+                    rank, reason = STATUS_RANK[status], reasons[iid].get(status, "")
+            return rank, reason
 
         out = {}
         for iid, ins in insights.items():
@@ -178,12 +253,13 @@ class FabricLog:
             if len({x["node"] for x in bad}) >= QUORUM:
                 derived = STATUS_QUARANTINED  # outranks VERIFIED: fail closed
 
-            rank = max(STATUS_RANK[derived], explicit[iid])
+            exp_rank, exp_reason = explicit_for(iid)
+            rank = max(STATUS_RANK[derived], exp_rank)
             status = next(s for s, r in STATUS_RANK.items() if r == rank)
             ins = dict(ins)
             ins["status"] = status
             ins["attestations"] = sorted(a.values(), key=lambda x: x["node"])
-            ins["status_reason"] = reasons.get(iid, "")
+            ins["status_reason"] = exp_reason if exp_rank == rank else ""
             out[iid] = ins
         return {"insights": out, "denies": denies}
 

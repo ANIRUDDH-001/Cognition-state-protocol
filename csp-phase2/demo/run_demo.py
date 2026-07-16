@@ -30,6 +30,7 @@ from metrics.telemetry import (
     SLO_CONTRACT_DURATION_MS,
     SLO_MSG_LATENCY_P95_MS,
     SLO_WINDOW,
+    p95,
 )
 from nodes import Mesh
 
@@ -60,7 +61,14 @@ def narrate_pipeline(rep: dict, inc) -> None:
     ev = ins["evidence"]
     b, a = ev["metric_before"], ev["metric_after"]
 
-    print(f"\n  {C['b']}ANALYZER{C['x']} (rules, node {ins['provenance']['discovered_by']}) drafts a hypothesis")
+    who = ins["provenance"].get("analyzer", "rules")
+    draft = rep.get("draft") or {}
+    print(f"\n  {C['b']}ANALYZER{C['x']} ({who}, node {ins['provenance']['discovered_by']}) "
+          f"drafts a hypothesis")
+    if who == "gemini" and draft.get("hypothesis"):
+        print(f"    {C['dim']}{draft['hypothesis']}{C['x']}")
+        print(f"    {C['dim']}the model drafted this; it has no write path and no accept")
+        print(f"    authority. What follows is what decides (Doc 5 §2).{C['x']}")
     print(f"    cited spans : {', '.join(s['span_id'] for s in inc.worst_spans) or '-'}")
     print(f"    claim.params: {json.dumps(claim.get('params', {}))}")
     print(f"    warm_start  : {'yes -- the settlement we already know for this context' if claim.get('warm_start') else 'no'}")
@@ -74,7 +82,17 @@ def narrate_pipeline(rep: dict, inc) -> None:
     print(f"    evidence carries a replayable scenario ..... {C['ok']}{OK}{C['x']}")
     print(f"    -> {C['ok']}ALLOW{C['x']}  (id {ins['id']})")
 
+    # Show what a PEER measured, not what the author claimed. On an honest insight
+    # they are equal -- but printing the claim under a "peer replay" heading would
+    # be showing the attacker's own numbers back as if they were verification
+    # output, which is exactly the thing this act exists to disprove.
+    replayed = next((at for at in rep["attestations"]
+                     if at["insight"] == ins["id"] and at["stage"] == "replay"), None)
+    src = "as re-measured by peer " + replayed["node"] if replayed else "as claimed (unverified)"
+    if replayed:
+        b, a = replayed["before"], replayed["after"]
     print(f"\n  {C['b']}PEER REPLAY{C['x']} -- each node re-executes the recorded scenario itself")
+    print(f"    {C['dim']}{src}{C['x']}")
     print(f"    before: rounds={b['rounds']} dur={b['duration_ms']:.0f}ms aborted={b['aborted']}")
     print(f"    after : rounds={a['rounds']} dur={a['duration_ms']:.0f}ms aborted={a['aborted']}")
     ratio = a["duration_ms"] / b["duration_ms"] if b["duration_ms"] else 1
@@ -86,8 +104,6 @@ def narrate_pipeline(rep: dict, inc) -> None:
         detail = at.get("replay_hash", "")[:16] if at["ok"] else at.get("reason", "")
         print(f"    ATTEST {at['node']} {mark} {C['dim']}{detail}{C['x']}")
 
-    hashes = {a2.get("replay_hash") for a2 in rep["attestations"]
-              if a2["insight"] == ins["id"] and a2["ok"]}
     if rep["status"] == STATUS_VERIFIED:
         print(f"    {C['dim']}two independent nodes produced the SAME replay hash{C['x']}")
         print(f"    -> {C['ok']}{C['b']}VERIFIED {ins['id']}{C['x']} -- now collective memory")
@@ -95,11 +111,42 @@ def narrate_pipeline(rep: dict, inc) -> None:
         print(f"    -> {C['warn']}{rep['status']}{C['x']}")
 
 
+def fabric_event(mesh) -> dict:
+    """A snapshot of every replica: what the UI's node columns render."""
+    nodes = {}
+    for n in sorted(mesh.nodes):
+        idx, head = mesh.nodes[n].log.head()
+        state = mesh.nodes[n].state()
+        nodes[n] = {
+            "chain_idx": idx,
+            "head": head[:12],
+            "digest": mesh.nodes[n].log.digest()[:12],
+            "down": mesh.faults.down(n),
+            "insights": sorted(
+                ({"id": i, "status": s["status"],
+                  "scope": s.get("scope", {}).get("context", {}),
+                  "analyzer": s.get("provenance", {}).get("analyzer", "rules"),
+                  "discovered_by": s.get("provenance", {}).get("discovered_by", "?")}
+                 for i, s in state.items()),
+                key=lambda x: x["id"]),
+        }
+    summary = mesh.fabric_summary()
+    return {"type": "fabric", "nodes": nodes, "converged": mesh.converged(),
+            "denies": summary["denies"]}
+
+
 def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
-        pace: float = 0.0) -> tuple:
-    mesh = Mesh(seed=seed, out_dir=out_dir, fabric_on=fabric_on)
+        pace: float = 0.0, analyzer: str = "rules", on_event=None, on_record=None) -> tuple:
+    """Run the 30-task flow. `on_event(dict)` receives structured beats -- the same
+    ones the narration prints -- so the live UI renders this exact code path rather
+    than a parallel one built to look like it. `on_record` forwards raw telemetry."""
+    emit = on_event or (lambda _e: None)
+    mesh = Mesh(seed=seed, out_dir=out_dir, fabric_on=fabric_on, analyzer=analyzer,
+                log=(lambda *a: None) if quiet else print, on_record=on_record)
     rows, first_warm, verified_at = [], None, None
     act = 0
+    emit({"type": "run_start", "seed": seed, "fabric_on": fabric_on,
+          "analyzer": analyzer, "tasks": 30})
 
     for t in generate(seed, 30):
         a = ACT_OF_ERA[t.era]
@@ -118,6 +165,17 @@ def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
         r = mesh.run_task(t)
         rows.append(r)
         note = ""
+
+        res = r["result"]
+        emit({"type": "task", "idx": t.idx, "era": t.era, "act": ACT_OF_ERA[t.era],
+              "link_quality": t.ctx["link_quality"], "workload": t.ctx["workload"],
+              "node": r["node"], "peer": r["peer"], "rounds": res.rounds,
+              "duration_ms": round(res.duration_ms, 1), "aborted": res.aborted,
+              "abort_reason": res.abort_reason, "epoch": r["epoch"],
+              "insight_ids": r["insight_ids"], "warm": bool(r["warm"]),
+              "p95_latency_ms": round(p95(mesh.telemetry.session_latencies(
+                  f"t{t.idx:02d}-{r['node']}x{r['peer']}")), 1),
+              "fabric_on": fabric_on})
 
         if not fabric_on:
             if not quiet:
@@ -138,6 +196,8 @@ def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
             if pace:
                 time.sleep(pace)
 
+        emit(fabric_event(mesh))
+
         inc = r["incident"]
         if not inc:
             continue
@@ -157,14 +217,53 @@ def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
             for s in inc.worst_spans:
                 print(f"    worst span {s['type']:<14} {s['from']} -> {s['to']}  {s['latency_ms']}ms")
 
+        emit({"type": "incident", "id": inc.id, "node": inc.node,
+              "breached_slo": inc.breached_slo, "p95": round(inc.window_stats["p95"], 1),
+              "threshold": inc.window_stats.get("threshold"),
+              "worst_spans": inc.worst_spans, "task_idx": t.idx})
+
         rep = mesh.pipeline_step(node, inc)
         if not quiet:
             narrate_pipeline(rep, inc)
             rule()
         if rep.get("status") == STATUS_VERIFIED:
             verified_at = t.idx
+        emit(pipeline_event(rep, inc))
+        emit(fabric_event(mesh))
 
+    emit({"type": "run_end", "first_warm": first_warm, "verified_at": verified_at})
     return mesh, rows, {"first_warm": first_warm, "verified_at": verified_at}
+
+
+def pipeline_event(rep: dict, inc) -> dict:
+    """The insight lifecycle beat: analyzer -> guardrail -> peer replay -> status."""
+    ins = rep.get("insight")
+    if ins is None:
+        d = rep.get("decision")
+        return {"type": "pipeline", "insight": None,
+                "denied": {"reason": d.reason, "detail": d.detail} if d and not d.ok else None}
+    atts = [a for a in rep["attestations"] if a["insight"] == ins["id"]]
+    replayed = next((a for a in atts if a["stage"] == "replay"), None)
+    draft = rep.get("draft") or {}
+    return {
+        "type": "pipeline",
+        "id": ins["id"],
+        "incident": inc.id,
+        "analyzer": ins["provenance"].get("analyzer", "rules"),
+        "discovered_by": ins["provenance"]["discovered_by"],
+        # Narration only: prose from an advisor, never part of the signed insight.
+        "hypothesis": draft.get("hypothesis", ""),
+        "claim": ins["claim"],
+        "cited_span_ids": draft.get("cited_span_ids", []),
+        # What a PEER measured, never what the author claimed (Doc 5 §3).
+        "before": replayed["before"] if replayed else ins["evidence"]["metric_before"],
+        "after": replayed["after"] if replayed else ins["evidence"]["metric_after"],
+        "measured_by": replayed["node"] if replayed else None,
+        "attestations": [{"node": a["node"], "ok": a["ok"],
+                          "replay_hash": (a.get("replay_hash") or "")[:16],
+                          "stage": a["stage"], "reason": a.get("reason")} for a in atts],
+        "status": rep.get("status"),
+    }
 
 
 def summarize(mesh, rows, base_rows=None) -> dict:
@@ -239,6 +338,8 @@ def main(argv=None) -> int:
     ap.add_argument("--chaos", action="store_true")
     ap.add_argument("--charts", action="store_true")
     ap.add_argument("--pace", type=float, default=0.0, help="seconds to pause per task")
+    ap.add_argument("--analyzer", choices=["rules", "gemini"], default="rules",
+                    help="hypothesis source; gemini falls back to rules on any failure")
     ap.add_argument("--out", default="out")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args(argv)
@@ -247,16 +348,20 @@ def main(argv=None) -> int:
     os.makedirs(args.out, exist_ok=True)
 
     banner("COGNITION FABRIC -- Phase 2: The Continuous Mesh & The Ratchet Effect")
-    print(f"  seed={args.seed}  fabric={args.fabric}  nodes=N1,N2,N3  "
-          f"tasks=30  transport=in-proc (virtual clock)")
+    print(f"  seed={args.seed}  fabric={args.fabric}  analyzer={args.analyzer}  "
+          f"nodes=N1,N2,N3  tasks=30  transport=in-proc (virtual clock)")
     print(f"  {C['dim']}Every number below is measured. Same seed reproduces this run exactly.{C['x']}")
 
     base_rows = None
-    if fabric_on and (args.charts or True):
-        # The baseline costs nothing to run: time is virtual.
-        _bm, base_rows, _ = run(args.seed, False, quiet=True, out_dir=os.path.join(args.out, "baseline"))
+    if fabric_on:
+        # The baseline costs nothing to run: time is virtual. Always `rules` --
+        # the baseline exists to isolate the FABRIC's effect, so the only thing
+        # that may differ between the two runs is whether the pipeline is on.
+        _bm, base_rows, _ = run(args.seed, False, quiet=True,
+                                out_dir=os.path.join(args.out, "baseline"))
 
-    mesh, rows, marks = run(args.seed, fabric_on, out_dir=args.out, pace=args.pace)
+    mesh, rows, marks = run(args.seed, fabric_on, out_dir=args.out, pace=args.pace,
+                            analyzer=args.analyzer)
 
     chaos_reports = []
     if args.chaos and fabric_on:

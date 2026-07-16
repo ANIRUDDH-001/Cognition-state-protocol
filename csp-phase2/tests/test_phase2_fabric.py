@@ -216,6 +216,116 @@ def test_insight_id_binds_its_content():
     assert compute_id(ins) != ins["id"], "id must not survive a content change"
 
 
+def test_guardrail_denies_an_id_that_does_not_bind_its_content():
+    """`id` is excluded from the signed body, so it is author-chosen until we
+    re-derive it -- and it is the primary key the fold indexes everything by."""
+    g = Guardrail(keyring_for("N1"))
+    ins = build(good_claim()).to_dict()
+    ins["id"] = "ins-000000000000"
+    assert g.check(ins).reason == "INVALID_SIG"
+
+
+@pytest.mark.parametrize("ins", [
+    {}, {"id": "ins-x"}, {"not": "an insight"},
+    {"id": "i", "version": 1, "scope": {}, "claim": {}, "evidence": {}, "provenance": "nope"},
+])
+def test_guardrail_denies_malformed_insights_instead_of_raising(ins):
+    """A guardrail that raises is a guardrail that failed open: it runs on every
+    peer, over bodies a compromised node authored."""
+    g = Guardrail(keyring_for("N1"))
+    d = g.check(ins)
+    assert not d.ok and d.reason in ("MALFORMED_EVIDENCE", "UNKNOWN_SOURCE")
+
+
+def test_a_poisoned_body_cannot_inherit_a_verified_insights_id():
+    """The identity-hijack attack. A rogue publishes a poisoned body, correctly
+    signed over its OWN content, under an already-VERIFIED insight's id. The fold
+    keys attestations and quorum by id, so an unbound id would let it inherit two
+    honest nodes' attestations and be applied as VERIFIED, never having been
+    replayed by anyone."""
+    kr = keyring_for("N1", "N2", "N3")
+    # N2 authors honestly; the rogue is N1, which sorts EARLIER and so would win
+    # the fold's first-writer-wins tie-break for the shared id.
+    good = build(good_claim(), ident=Identity.deterministic("N2"), node="N2").to_dict()
+    log = FabricLog("N2", Identity.deterministic("N2"), kr)
+    log.append(KIND_INSIGHT, {"insight": good})
+    for n in ("N1", "N3"):
+        peer = FabricLog(n, Identity.deterministic(n), kr)
+        log.ingest(peer.append(KIND_ATTEST,
+                               {"insight_id": good["id"], "ok": True, "replay_hash": "H"}))
+    assert log.fold()["insights"][good["id"]]["status"] == STATUS_VERIFIED
+
+    evil = build({"params": {"negotiate_timeout_ms": 1000, "r_max": 2}},
+                 ident=Identity.deterministic("N1"), node="N1").to_dict()
+    evil["id"] = good["id"]
+    rogue = FabricLog("N1", Identity.deterministic("N1"), kr)
+    # force_append: the rogue's own log does not validate. The honest peer's
+    # ingest is the defence under test.
+    assert not log.ingest(rogue.force_append(KIND_INSIGHT, {"insight": evil})), \
+        "an id that does not bind its content must never enter the fabric"
+
+    folded = log.fold()["insights"][good["id"]]
+    assert folded["claim"] == good["claim"], "the VERIFIED body must be untouched"
+    params, _w, _ids, _e = active_params({good["id"]: folded}, LOSSY_CTX, DEFAULT_PARAMS)
+    assert params["negotiate_timeout_ms"] == 30000, "the rogue's claim must not be applied"
+
+
+def test_a_signed_but_malformed_entry_cannot_break_the_fold():
+    """Every node folds the shared set. A signature proves authorship, not shape,
+    so one signed piece of garbage from a pinned node must not be able to make the
+    whole fabric unreadable."""
+    kr = keyring_for("N1", "N3")
+    log = FabricLog("N1", Identity.deterministic("N1"), kr)
+    log.append(KIND_INSIGHT, {"insight": build(good_claim()).to_dict()})
+    rogue = FabricLog("N3", Identity.deterministic("N3"), kr)
+    for body in ({"insight": {"not": "an insight"}}, {}, {"insight": None}):
+        assert not log.ingest(rogue.force_append(KIND_INSIGHT, body))
+    assert not log.ingest(rogue.force_append("NOT_A_KIND", {"insight_id": "x"}))
+    log.fold()  # must not raise
+    assert len(log.fold()["insights"]) == 1
+
+
+def test_one_node_cannot_revoke_what_the_network_verified():
+    """Promotion needs 2-of-3. Demotion must too -- otherwise a single pinned but
+    compromised node resets the collective memory to zero on its own, which is the
+    exact outcome the pruning design claims to rule out."""
+    kr = keyring_for("N1", "N2", "N3")
+    good = build(good_claim()).to_dict()
+    log = FabricLog("N1", Identity.deterministic("N1"), kr)
+    log.append(KIND_INSIGHT, {"insight": good})
+    for n in ("N2", "N3"):
+        peer = FabricLog(n, Identity.deterministic(n), kr)
+        log.ingest(peer.append(KIND_ATTEST,
+                               {"insight_id": good["id"], "ok": True, "replay_hash": "H"}))
+    assert log.fold()["insights"][good["id"]]["status"] == STATUS_VERIFIED
+
+    rogue = FabricLog("N3", Identity.deterministic("N3"), kr)
+    log.ingest(rogue.append(KIND_STATUS,
+                            {"insight_id": good["id"], "status": STATUS_REVOKED, "reason": "x"}))
+    assert log.fold()["insights"][good["id"]]["status"] == STATUS_VERIFIED, \
+        "one node's demotion vote must not bind the fabric"
+
+    second = FabricLog("N2", Identity.deterministic("N2"), kr)
+    log.ingest(second.append(KIND_STATUS,
+                             {"insight_id": good["id"], "status": STATUS_REVOKED, "reason": "x"}))
+    assert log.fold()["insights"][good["id"]]["status"] == STATUS_REVOKED, \
+        "two independent nodes agreeing must still be able to prune"
+
+
+def test_verify_refuses_evidence_that_does_not_match_the_replay():
+    """The headline anti-hallucination claim, made literal: the claimed numbers
+    must BE the measured numbers, not merely accompany them."""
+    honest = build(good_claim()).to_dict()
+    assert verify(honest, DEFAULT_PARAMS)[0] is True
+
+    liar = build(good_claim()).to_dict()
+    liar["evidence"]["metric_after"] = dict(liar["evidence"]["metric_after"],
+                                            duration_ms=1.0, rounds=1)
+    ok, _h, _b, after = verify(liar, DEFAULT_PARAMS)
+    assert ok is False, "a fabricated metric_after must not verify"
+    assert after["duration_ms"] != 1.0, "the returned summary is what we measured"
+
+
 # --- poisoning: fabricated evidence (chaos F2d) -------------------------------
 
 
@@ -342,16 +452,46 @@ def test_conflicting_fixes_in_different_contexts_coexist():
     assert w_n is None, "the normal-scoped insight carries no warm start"
 
 
+def _with_margin(ins: dict, before_ms: float, after_ms: float) -> dict:
+    """Set the evidence metrics -- the numbers a peer re-derives at replay and
+    refuses to attest to unless they match (see _evidence_matches)."""
+    ins = dict(ins)
+    ins["evidence"] = dict(ins["evidence"],
+                           metric_before=dict(ins["evidence"]["metric_before"],
+                                              duration_ms=before_ms),
+                           metric_after=dict(ins["evidence"]["metric_after"],
+                                             duration_ms=after_ms))
+    return ins
+
+
 def test_same_scope_conflict_resolves_deterministically_by_improvement():
     weak = build(good_claim()).to_dict()
     weak["status"] = STATUS_VERIFIED
-    weak["evidence"]["claimed_improvement"] = {"rounds": -1, "duration_ms": -500.0}
+    weak = _with_margin(weak, 9000.0, 8500.0)  # -500ms
     strong = dict(weak, id="ins-strong0000", claim={"params": {"negotiate_timeout_ms": 45000}})
-    strong["evidence"] = dict(weak["evidence"],
-                              claimed_improvement={"rounds": -4, "duration_ms": -6000.0})
+    strong = _with_margin(strong, 9000.0, 3000.0)  # -6000ms
     state = {weak["id"]: weak, strong["id"]: strong}
     _p, _w, ids, _e = active_params(state, LOSSY_CTX, DEFAULT_PARAMS)
     assert ids == ["ins-strong0000"], "the bigger proven improvement must win"
+
+
+def test_conflict_ranking_ignores_a_self_reported_claimed_improvement():
+    """`claimed_improvement` is narration: it is author-supplied and no peer ever
+    re-derives it. Ranking on it let an insight win every same-scope conflict
+    forever by claiming an improvement it never demonstrated."""
+    honest = build(good_claim()).to_dict()
+    honest["status"] = STATUS_VERIFIED
+    honest = _with_margin(honest, 9000.0, 3000.0)  # really -6000ms
+    honest["evidence"]["claimed_improvement"] = {"rounds": -4, "duration_ms": -6000.0}
+
+    liar = dict(honest, id="ins-liar000000", claim={"params": {"negotiate_timeout_ms": 11000}})
+    liar = _with_margin(liar, 9000.0, 8900.0)  # really only -100ms
+    liar["evidence"] = dict(liar["evidence"],
+                            claimed_improvement={"rounds": -99, "duration_ms": -999999.0})
+
+    _p, _w, ids, _e = active_params({honest["id"]: honest, liar["id"]: liar},
+                                    LOSSY_CTX, DEFAULT_PARAMS)
+    assert ids == [honest["id"]], "the measured improvement must win, not the loudest claim"
 
 
 def test_scope_matches_requires_every_scoped_key():
@@ -378,8 +518,10 @@ def test_revoke_tombstones_the_provenance_subtree_and_keeps_the_rest():
     for d in (parent, child, unrelated):
         node.log.append(KIND_INSIGHT, {"insight": d})
 
+    m.propagate(2)  # peers must hold the subtree before they can vote on it
     victims = m.revoke(node, parent["id"], "TEST")
     assert set(victims) == {parent["id"], child["id"]}, "descendants must go with the parent"
+    m.propagate(2)  # demotion binds at quorum, so the votes have to reach N1
 
     state = node.state()
     assert state[parent["id"]]["status"] == STATUS_REVOKED

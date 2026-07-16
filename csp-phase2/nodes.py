@@ -73,18 +73,21 @@ class Node:
 
 class Mesh:
     def __init__(self, seed: int = 42, out_dir: str = "out", node_ids=("N1", "N2", "N3"),
-                 fabric_on: bool = True, log=print):
+                 fabric_on: bool = True, log=print, analyzer: str = "rules",
+                 on_record=None):
         self.seed = seed
         self.out_dir = out_dir
         self.fabric_on = fabric_on
         self.log_fn = log
+        self.analyzer = analyzer
         os.makedirs(out_dir, exist_ok=True)
 
         self.rng = random.Random(seed)
         self.clock = Clock(0.0)
         self.faults = FaultState()
         self.keyring = Keyring()
-        self.telemetry = Telemetry(os.path.join(out_dir, "telemetry.jsonl"), self.clock)
+        self.telemetry = Telemetry(os.path.join(out_dir, "telemetry.jsonl"), self.clock,
+                                   on_record=on_record)
         self.bus = Bus(self.clock, self.faults, self.rng, self.keyring, self.telemetry)
 
         self.nodes = {n: Node(n, self.bus, self.keyring, self.telemetry, out_dir) for n in node_ids}
@@ -151,19 +154,38 @@ class Mesh:
 
     # --- the accelerator ------------------------------------------------------
 
+    def _draft(self, incident, last_agreed):
+        """Pick the hypothesis source. Rules is primary and always available; the
+        LLM is an upgrade behind a flag that falls back to rules on any failure.
+        Both return the same shape and both go through the same self-replay gate
+        in rules.build_draft -- the analyzer choice cannot widen what may be
+        claimed, only what may be guessed (Doc 5 §2)."""
+        if self.analyzer == "gemini":
+            from analyzer import gemini  # imported lazily: rules must never need it
+            return gemini.analyze(incident, last_agreed, DEFAULT_PARAMS, log=self.log_fn)
+        return rules.analyze(incident, last_agreed, DEFAULT_PARAMS)
+
     def draft_and_submit(self, node: Node, incident) -> tuple:
-        """analyzer -> guardrail -> announce. Returns (insight|None, decision|None)."""
+        """analyzer -> guardrail -> announce. Returns (insight|None, decision|None, draft|None).
+
+        The draft is returned for narration ONLY. Its `hypothesis` and
+        `cited_span_ids` are prose from an advisor and are deliberately NOT part of
+        the insight: the schema is closed on purpose (Doc 1 DR-3 -- "no free-text
+        field exists"), which is what stops an analyzer, human or model, from
+        smuggling unverifiable semantics into signed collective memory.
+        """
         scope_ctx = {"link_quality": incident.task_ctx["link_quality"]}
         if node.has_insight_for(scope_ctx):
-            return None, None
+            return None, None, None
         last = node.last_agreed.get(incident.task_ctx["link_quality"]) or \
             next(iter(node.last_agreed.values()), None)
-        draft = rules.analyze(incident, last, DEFAULT_PARAMS)
+        draft = self._draft(incident, last)
         if draft is None:
-            return None, None
+            return None, None, None
         ins = make_insight(draft["scope"], draft["claim"], draft["evidence"],
                            node.identity, node.id, draft.get("analyzer", "rules"))
-        return self.announce(node, ins)
+        got, decision = self.announce(node, ins)
+        return got, decision, draft
 
     def announce(self, node: Node, ins: Insight) -> tuple:
         """Guardrail on the discovering node, then append -> gossip carries it."""
@@ -178,9 +200,10 @@ class Mesh:
         return ins, d
 
     def inject_raw(self, node: Node, ins_dict: dict) -> None:
-        """Append an insight WITHOUT the local guardrail -- i.e. what a compromised
-        node does. The peers' guardrails are what must catch it. Used by chaos."""
-        node.log.append(KIND_INSIGHT, {"insight": ins_dict})
+        """Append an insight WITHOUT the local guardrail or the local schema gate --
+        i.e. what a compromised node does. The peers' ingest and guardrail are what
+        must catch it. Used by chaos."""
+        node.log.force_append(KIND_INSIGHT, {"insight": ins_dict})
         self.insights_seen[ins_dict["id"]] = ins_dict
 
     def attest_round(self) -> list:
@@ -228,15 +251,15 @@ class Mesh:
     def pipeline_step(self, node: Node, incident) -> dict:
         """One full accelerator pass: draft -> guardrail -> gossip -> peers replay
         -> attest -> gossip -> status derived. Returns a report for the narration."""
-        ins, decision = self.draft_and_submit(node, incident)
+        ins, decision, draft = self.draft_and_submit(node, incident)
         if ins is None:
-            return {"insight": None, "decision": decision, "attestations": []}
+            return {"insight": None, "decision": decision, "attestations": [], "draft": None}
         self.propagate()
         atts = self.attest_round()
         self.propagate()
         state = node.state().get(ins.id, {})
         return {"insight": ins.to_dict(), "decision": decision, "attestations": atts,
-                "status": state.get("status"), "id": ins.id}
+                "status": state.get("status"), "id": ins.id, "draft": draft}
 
     # --- probation / revoke (cheap canary, Doc 4 §7.4) ------------------------
 
@@ -270,21 +293,45 @@ class Mesh:
                 continue
             hist.append(bool(res.aborted or res.duration_ms > before * IMPROVEMENT_RATIO))
             if len(hist) == PROBATION_N and sum(hist) >= PROBATION_FAIL:
-                self.revoke(node, iid, "PROBATION_REGRESSION")
+                # This node's OWN vote, on this node's OWN evidence. Probation data
+                # is local and peers cannot re-derive it, so one node's regression
+                # is a vote, not a verdict: the fold demotes at quorum, meaning two
+                # nodes must independently watch the insight regress. One unlucky
+                # node does not get to erase what the network verified.
+                self.vote_revoke(node, iid, "PROBATION_REGRESSION")
 
-    def revoke(self, node: Node, insight_id: str, reason: str) -> list:
-        """Prune by provenance subtree. Tombstone, never rewrite."""
-        victims = [insight_id] + sorted(node.log.descendants(insight_id))
+    def vote_revoke(self, node: Node, insight_id: str, reason: str) -> list:
+        """One node's signed demotion vote for an insight and its descendants."""
+        victims = sorted({insight_id} | node.log.descendants(insight_id))
         for v in victims:
             node.log.append(KIND_STATUS, {"insight_id": v, "status": "REVOKED", "reason": reason})
+        self.telemetry.event("fabric.revoke_vote",
+                             {"node": node.id, "ids": victims, "reason": reason})
+        return victims
+
+    def revoke(self, node: Node, insight_id: str, reason: str) -> list:
+        """Prune by provenance subtree. Tombstone, never rewrite.
+
+        Every healthy node re-derives the subtree from its own replica and signs
+        its own entry. That is not a rubber stamp: `derived_from` lives in the
+        shared, signed entry set, so the subtree is a deterministic function of
+        data every node already holds -- honest nodes independently reach the same
+        verdict. Quorum then makes the demotion binding (see FabricLog.fold).
+        """
+        for peer in self._healthy():
+            self.vote_revoke(peer, insight_id, reason)
+        victims = sorted({insight_id} | node.log.descendants(insight_id))
         self.telemetry.event("fabric.revoke", {"node": node.id, "ids": victims, "reason": reason})
         return victims
 
     def tombstone(self, node: Node, insight_id: str, reason: str) -> list:
-        victims = [insight_id] + sorted(node.log.descendants(insight_id))
-        for v in victims:
-            node.log.append(KIND_TOMBSTONE, {"insight_id": v, "reason": reason})
-        return victims
+        for peer in self._healthy():
+            for v in sorted({insight_id} | peer.log.descendants(insight_id)):
+                peer.log.append(KIND_TOMBSTONE, {"insight_id": v, "reason": reason})
+        return sorted({insight_id} | node.log.descendants(insight_id))
+
+    def _healthy(self) -> list:
+        return [self.nodes[n] for n in sorted(self.nodes) if not self.faults.down(n)]
 
     # --- reporting ------------------------------------------------------------
 
@@ -299,11 +346,18 @@ class Mesh:
         return len(set(live)) <= 1
 
     def fabric_summary(self) -> dict:
+        """Fabric-wide view. Every node holds a replica of the same entry set once
+        gossip has converged, so this must count DISTINCT events -- summing the
+        replicas reported each denial three times (once per node) and inflated the
+        headline number by 3x."""
         state = {}
+        denies: dict = {}
         for n in sorted(self.nodes):
-            for iid, ins in self.nodes[n].log.fold()["insights"].items():
+            folded = self.nodes[n].log.fold()
+            for iid, ins in folded["insights"].items():
                 state.setdefault(iid, ins)
-        denies = []
-        for n in sorted(self.nodes):
-            denies.extend(self.nodes[n].log.fold()["denies"])
-        return {"insights": state, "denies": denies}
+            for d in folded["denies"]:
+                # The deny is identified by who authored it and what it is about,
+                # not by which replica we happened to read it from.
+                denies.setdefault((d["node"], d["insight_id"], d.get("reason")), d)
+        return {"insights": state, "denies": [denies[k] for k in sorted(denies)]}

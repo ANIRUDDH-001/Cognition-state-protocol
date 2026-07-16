@@ -46,10 +46,21 @@ def _rule(incident, last_agreed: dict | None) -> dict | None:
     return None
 
 
-def analyze(incident, last_agreed: dict | None = None, defaults: dict | None = None) -> dict | None:
-    """incident -> draft insight body, or None. Never returns an unreproduced claim."""
+def build_draft(incident, claim: dict, defaults: dict | None = None,
+                analyzer: str = "rules", hypothesis: str | None = None) -> dict | None:
+    """claim -> evidence -> SELF-VERIFY -> draft, or None. Shared by EVERY analyzer.
+
+    Whatever produced the claim -- a rule table or a language model -- it arrives
+    here and faces the same gate: we build the replayable evidence ourselves, we
+    replay it ourselves, and if our own replay will not reproduce the improvement
+    we return None and say nothing. An analyzer is an advisor; this function is
+    where its advice has to survive contact with the engine.
+
+    The metrics written here are the ones a peer re-derives and compares against
+    its own replay before attesting (insights.pipeline._evidence_matches), so they
+    cannot be decorative: they are the claim.
+    """
     base = dict(DEFAULT_PARAMS if defaults is None else defaults)
-    claim = _rule(incident, last_agreed)
     if not claim:
         return None
 
@@ -70,10 +81,16 @@ def analyze(incident, last_agreed: dict | None = None, defaults: dict | None = N
                 "duration_ms": round(after["duration_ms"] - before["duration_ms"], 3),
             },
         },
-        "analyzer": "rules",
-        "hypothesis": _hypothesis(incident),
+        "analyzer": analyzer,
+        "hypothesis": hypothesis or _hypothesis(incident),
         "cited_span_ids": [s["span_id"] for s in incident.worst_spans],
     }
+
+
+def analyze(incident, last_agreed: dict | None = None, defaults: dict | None = None) -> dict | None:
+    """incident -> draft insight body, or None. Never returns an unreproduced claim."""
+    claim = _rule(incident, last_agreed)
+    return build_draft(incident, claim, defaults, "rules") if claim else None
 
 
 def _hypothesis(incident) -> str:

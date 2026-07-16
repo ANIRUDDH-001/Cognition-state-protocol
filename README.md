@@ -23,7 +23,10 @@ python -m demo.run_demo --seed 42 --chaos --charts
 # baseline for comparison (same seed, pipeline disabled)
 python -m demo.run_demo --seed 42 --fabric off
 
-pytest -q                                          # 67 tests
+# Live UI — task stream, fabric replicas, insight lifecycle, chaos buttons
+python -m ui.server                                # -> http://127.0.0.1:8000
+
+pytest -q                                          # 94 tests
 ```
 
 Artifacts land in `csp-phase2/out/`: `summary.md`, `telemetry.jsonl`,
@@ -145,16 +148,34 @@ csp-phase2/
   fabric/     insight model, hash-chained signed log (grow-only set), gossip
   guardrail/  deterministic pre-admission checks + signed DENY entries
   insights/   replay-verify, quorum, scoped conflict resolution
-  analyzer/   rule-based incident analyzer (primary, no write path)
+  analyzer/   rules.py (primary, always on) + gemini.py (optional, grounding-gated)
+  ui/         FastAPI + websocket live view; a subscriber, never in the trust path
   metrics/    OTel-shaped JSONL + per-context rolling-window SLO evaluator
   loadgen/    seeded task flow with condition eras
   chaos/      F1 node down, F2 poisoned updates, F3 partition/heal
   demo/       run_handshake.py (Phase 1), run_demo.py (Phase 2), charts.py
-  tests/      67 tests: Phase 1 core, Phase 2 fabric, chaos + demo
+  tests/      94 tests: Phase 1 core, Phase 2 fabric, chaos + demo, analyzer + UI
   nodes.py    Node = personas + fabric replica + guardrail + analyzer; Mesh
 ```
 
-The build plan this implements is `04_phase2_implementation_plan.md`. Docs 01–03
+## Is there a real AI in this?
+
+Yes, in exactly one place, and the placement is the argument. `--analyzer gemini` lets a
+model draft incident *hypotheses* behind a grounding gate that rejects invented span ids
+and non-whitelisted knobs; it votes on *whether* to warm-start, never on the settlement
+point. It has no write path and no accept authority. Everything it drafts is rebuilt as
+typed bounded fields, replayed by the drafting node, then independently replayed by two
+peers who must reproduce our exact numbers.
+
+It is deliberately **not** in the negotiation loop. `replay()` being byte-identical across
+nodes *is* the anti-hallucination gate — an LLM inside `negotiate()` would put
+non-determinism inside the verification primitive the whole argument rests on. Here, being
+wrong is free: a bad hypothesis costs one replay and dies. Rules stay primary and always
+on; any failure (no key, timeout, bad JSON, ungrounded output) falls back to them, loudly.
+Rehearse it with `GEMINI_API_KEY` unset — the gate firing is the point.
+
+The build plans this implements are `04_phase2_implementation_plan.md` (the fabric) and
+`05_phase2_agents_and_ui_plan.md` (the analyzer and UI). Docs 01–03
 (architecture, Phase 1 prototype spec, scalability roadmap) are the Phase 1 blueprint and
 are currently excluded by `.gitignore`, as are the Cisco-Confidential problem statements.
 

@@ -12,12 +12,10 @@ property we actually claim: no node trusts an insight because of who sent it.
 from __future__ import annotations
 
 from core.bus import LOSSY_DELAY_MS, NORMAL_DELAY_MS, FaultState
-from core.crypto import canonical
 from core.csp_mini import build_scenario
 from core.registry import DEFAULT_PARAMS
-from core.types import STATUS_QUARANTINED, STATUS_VERIFIED
-from fabric.log import KIND_INSIGHT
-from fabric.model import Insight, compute_id, make_insight, signing_body
+from core.types import STATUS_VERIFIED
+from fabric.model import Insight, compute_id, make_insight
 from insights.pipeline import verify
 
 GOOD_WARM = {
@@ -102,8 +100,12 @@ def f2_poisoned(mesh, rogue: str = "N3") -> dict:
     attacks = []
 
     # (a) tampered after signing -> the signature no longer covers the content.
+    #     The id IS recomputed, so the entry is well-formed and really does enter
+    #     the fabric: the attacker can re-derive a hash, it cannot forge Ed25519.
+    #     This is what makes the peer guardrail (not the schema gate) the catcher.
     a = craft(mesh, rogue, {"params": {"negotiate_timeout_ms": 30000}})
     a["claim"]["params"]["negotiate_timeout_ms"] = 59000
+    a["id"] = compute_id(a)
     attacks.append(("a", "tampered claim, stale signature", "INVALID_SIG", a))
 
     # (b) a tunable pushed outside its bounds.
@@ -142,6 +144,15 @@ def f2_poisoned(mesh, rogue: str = "N3") -> dict:
             "verdicts": [(r["node"], r["ok"], r.get("reason") or r.get("stage")) for r in mine],
             "blocked": status != STATUS_VERIFIED,
         })
+
+    # A fifth attack -- a poisoned body published under an already-VERIFIED
+    # insight's id, to inherit its attestations -- is refused by every honest peer
+    # at ingest, because the id must re-derive from the content it names
+    # (fabric/log.valid_body). It is NOT staged here on purpose: an entry the
+    # peers refuse stays in the rogue's own log forever, so its entry set can
+    # never match theirs, and this act's convergence proof would report a split
+    # fabric for a reason that has nothing to do with partitions. It is covered by
+    # test_a_poisoned_body_cannot_inherit_a_verified_insights_id instead.
 
     # Pruning: tombstone (d) and anything derived from it. The good insight stays.
     child = craft(mesh, rogue, {"params": {"negotiate_timeout_ms": 1200}},

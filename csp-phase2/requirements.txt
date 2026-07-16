@@ -1,0 +1,14 @@
+# Python 3.11+ (Doc 2 §1). Use a venv -- these are not expected system-wide.
+cryptography          # Ed25519, SHA-256 (Doc 2 §11)
+matplotlib            # charts only: python -m demo.run_demo --charts
+pytest                # tests only
+
+# Live UI only: python -m ui.server
+# [standard] is NOT optional: plain `uvicorn` has no WebSocket library, so the page
+# renders perfectly and streams nothing. Found by screenshotting it, not by reading it.
+fastapi
+uvicorn[standard]
+
+# NOTE: the Gemini analyzer (analyzer/gemini.py) deliberately uses urllib from the
+# stdlib rather than `requests` (which Doc 4 §2 listed). One less dependency to
+# install on a venue's wifi, and the fallback-to-rules path must work offline anyway.

@@ -41,9 +41,10 @@ def summarize(r) -> dict:
 def verify(insight: dict, defaults: dict | None = None) -> tuple[bool, str, dict, dict]:
     """Replay verification (Doc 4 §7.4). Pure: no I/O, no clock, no network.
 
-    Returns (improved, replay_hash, before_summary, after_summary).
+    Returns (improved, replay_hash, before_summary, after_summary) -- where the
+    summaries are what THIS verifier measured, never what the insight claimed.
     Two honest nodes running this on the same insight MUST get the same
-    replay_hash -- that equality is what quorum actually checks.
+    replay_hash; that equality is what quorum actually checks.
     """
     base = dict(DEFAULT_PARAMS if defaults is None else defaults)
     scen = insight["evidence"]["scenario"]
@@ -60,15 +61,47 @@ def verify(insight: dict, defaults: dict | None = None) -> tuple[bool, str, dict
         # improvement regardless of how many rounds it took.
         and (r_before.aborted or r_after.rounds <= r_before.rounds)
     )
+    # The claimed numbers must BE the measured numbers. Without this the evidence
+    # block is decorative: a rogue node can attach any metrics it likes and they
+    # are never contradicted, because everything downstream reads the claim rather
+    # than the replay. This is what makes "a fabricated metric_after dies at
+    # replay" literally true rather than incidentally true (chaos F2d).
+    if not _evidence_matches(insight.get("evidence") or {}, r_before, r_after):
+        improved = False
     replay_hash = sha256_hex(canonical({"a": r_after.summary(), "b": r_before.summary()}))
     return improved, replay_hash, r_before.summary(), r_after.summary()
 
 
+def _evidence_matches(ev: dict, r_before, r_after) -> bool:
+    """Claimed metrics vs measured ones. Absent metrics are the analyzer's own
+    pre-submission dry run (it calls verify() to FILL them); a peer never sees
+    that case, because the guardrail rejects evidence without them.
+    """
+    for key, measured in (("metric_before", r_before), ("metric_after", r_after)):
+        claimed = ev.get(key)
+        if claimed is None:
+            continue
+        if canonical(claimed) != canonical(measured.summary()):
+            return False
+    return True
+
+
 def _preference(ins: dict) -> tuple:
-    """Same-scope conflict resolution (Doc 4 §7.5): biggest claimed improvement
-    wins, tie -> newer version, tie -> lower id hash. Total order, no coin flips."""
-    imp = ins.get("evidence", {}).get("claimed_improvement", {})
-    return (float(imp.get("duration_ms", 0.0)), -int(ins.get("version", 1)), ins["id"])
+    """Same-scope conflict resolution (Doc 4 §7.5): biggest improvement wins,
+    tie -> newer version, tie -> lower id hash. Total order, no coin flips.
+
+    The margin is derived from the evidence metrics, NOT from the author's
+    `claimed_improvement`. Both are author-supplied, but the metrics are the ones
+    peers re-derive and compare against their own replay before attesting
+    (see _evidence_matches), so on a VERIFIED insight they are measured facts.
+    `claimed_improvement` is narration and is deliberately not consulted: ranking
+    on it let an insight win every conflict forever by simply claiming -999999.
+    """
+    ev = ins.get("evidence") or {}
+    before = (ev.get("metric_before") or {}).get("duration_ms")
+    after = (ev.get("metric_after") or {}).get("duration_ms")
+    margin = float(after) - float(before) if before is not None and after is not None else 0.0
+    return (margin, -int(ins.get("version", 1)), ins["id"])
 
 
 def active_params(state: dict, task_ctx: dict, defaults: dict | None = None) -> tuple:

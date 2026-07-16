@@ -14,6 +14,7 @@ analyzer can say WHERE it went slow rather than merely that it did.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import defaultdict, deque
 
@@ -39,18 +40,28 @@ def p95(values: list) -> float:
     if not values:
         return 0.0
     s = sorted(values)
-    # Nearest-rank p95. Deterministic; no interpolation to argue about.
-    k = max(0, min(len(s) - 1, int(round(0.95 * len(s) + 0.5)) - 1))
+    # Nearest-rank p95: the smallest value at or above 95% of the sample.
+    # math.ceil, not round(): round() is banker's rounding, so at n=20 it took
+    # rank 20 of 20 and reported the MAX as the p95.
+    k = max(0, min(len(s) - 1, math.ceil(0.95 * len(s)) - 1))
     return s[k]
 
 
 class Telemetry:
-    def __init__(self, out_path: str | None = None, clock=None):
+    """Every observable event funnels through _write(), which is why `on_record`
+    is the only hook the live UI needs: spans, metrics, SLO breaches, guardrail
+    denials and revokes all pass through here already. A subscriber renders the
+    system; it is never in the trust path, and it must never be able to break a
+    run -- hence the try/except around it.
+    """
+
+    def __init__(self, out_path: str | None = None, clock=None, on_record=None):
         self.clock = clock
         self.records: list = []
         self.by_session: dict = defaultdict(list)  # session -> [latency_ms]
         self.counters: dict = defaultdict(int)
         self.out_path = out_path
+        self.on_record = on_record
         if out_path:
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             open(out_path, "w").close()
@@ -60,6 +71,11 @@ class Telemetry:
         if self.out_path:
             with open(self.out_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
+        if self.on_record is not None:
+            try:
+                self.on_record(rec)
+            except Exception:
+                pass  # a broken viewer never breaks the fabric
 
     def metric(self, name: str, value: float, attrs: dict | None = None) -> None:
         attrs = attrs or {}

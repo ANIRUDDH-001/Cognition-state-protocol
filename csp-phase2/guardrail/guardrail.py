@@ -16,7 +16,9 @@ from collections import defaultdict, deque
 from core.crypto import Keyring, canonical
 from core.registry import DIM, POLICY_FLOOR, TUNABLE_BOUNDS, coupling_ok, levels
 from core.types import Allow, Deny
-from fabric.model import signing_body
+from fabric.model import compute_id, signing_body
+
+_REQUIRED = ("id", "version", "scope", "claim", "evidence", "provenance")
 
 RATE_LIMIT_N = 5
 RATE_LIMIT_WINDOW_MS = 60_000
@@ -40,14 +42,33 @@ class Guardrail:
 
     def check(self, ins: dict) -> Allow | Deny:
         """Ordered checks. First failure wins; the reason code is the audit record."""
-        prov = ins.get("provenance") or {}
+        # 0. Shape. Every check below indexes into this structure, so a missing
+        #    key must come back as a DENY, not an exception -- an exception out of
+        #    the guardrail is a guardrail that failed open.
+        if not isinstance(ins, dict) or not all(k in ins for k in _REQUIRED):
+            return Deny("MALFORMED_EVIDENCE", "insight is missing required fields")
+        if not isinstance(ins.get("provenance"), dict):
+            return Deny("MALFORMED_EVIDENCE", "provenance is not an object")
+
+        prov = ins["provenance"]
         src = prov.get("discovered_by")
 
         # 1. Identity: signature verifies against the PINNED key of the claimed source.
         if not src or not self.keyring.known(src):
             return Deny("UNKNOWN_SOURCE", f"no pinned key for {src!r}")
-        if not self.keyring.verify(src, prov.get("sig", ""), canonical(signing_body(ins))):
+        try:
+            body = canonical(signing_body(ins))
+        except (KeyError, TypeError, ValueError) as e:
+            return Deny("MALFORMED_EVIDENCE", f"insight is not canonicalizable: {e}")
+        if not self.keyring.verify(src, prov.get("sig", ""), body):
             return Deny("INVALID_SIG", f"signature does not verify for {src}")
+
+        # 1b. The id must be re-derivable from the signed body. `id` sits OUTSIDE
+        #     the signature (it is a hash of what is inside it), so an unchecked id
+        #     is an attacker-chosen primary key -- and the fold keys attestations,
+        #     status and quorum by exactly that key.
+        if compute_id(ins) != ins["id"]:
+            return Deny("INVALID_SIG", f"id {ins['id']!r} does not bind its content")
 
         claim = ins.get("claim") or {}
         if not isinstance(claim, dict) or not claim:
