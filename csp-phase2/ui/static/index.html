@@ -70,6 +70,7 @@
 <header>
   <h1>COGNITION FABRIC <small>Phase 2 — The Continuous Mesh &amp; The Ratchet Effect</small></h1>
   <span class="pill" id="status">idle</span>
+  <span class="pill" id="analyzer-note" style="display:none"></span>
   <div class="spacer"></div>
   <label>seed <input id="seed" type="number" value="42" style="width:62px"></label>
   <label>analyzer
@@ -311,6 +312,17 @@ const handlers = {
       `<div class="bad b">INCIDENT ${esc(e.id)} — ${esc(e.breached_slo)} p95 =
        ${Math.round(e.p95)}ms &gt; SLO ${esc(e.threshold)}ms</div>
        <div class="dim">analyzer is drafting…</div>`; },
+  // The fallback is a feature, but only if you can SEE it: a gemini badge over a
+  // silent rules run is the demo claiming something the code did not do.
+  analyzer_note: e => {
+    const n = $("analyzer-note");
+    const rejected = /rejected|discarded/.test(e.text);
+    n.style.display = "";
+    n.style.color = rejected ? "var(--warn)" : "var(--ok)";
+    n.style.borderColor = rejected ? "var(--warn)" : "var(--ok)";
+    n.textContent = e.text.replace(/^\[analyzer\]\s*/, "analyzer: ");
+    n.title = e.text;
+  },
   run_end: () => { setRunning(false); enableChaos(true); },
   idle: () => setRunning(false),
   error: e => { $("status").textContent = "error"; $("status").style.color="var(--bad)";

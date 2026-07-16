@@ -141,8 +141,19 @@ def run(seed: int, fabric_on: bool, quiet: bool = False, out_dir: str = "out",
     ones the narration prints -- so the live UI renders this exact code path rather
     than a parallel one built to look like it. `on_record` forwards raw telemetry."""
     emit = on_event or (lambda _e: None)
+
+    def _log(*a) -> None:
+        """Analyzer notes go to the console AND the event stream. A UI that swallows
+        `gemini output rejected: ... -- using rules` shows a gemini badge over a rules
+        run: you would demo the model while the rule table did the work. The fallback
+        is a feature, so it has to be visible wherever the run is being watched."""
+        msg = " ".join(str(x) for x in a)
+        if not quiet:
+            print(msg)
+        emit({"type": "analyzer_note", "text": msg})
+
     mesh = Mesh(seed=seed, out_dir=out_dir, fabric_on=fabric_on, analyzer=analyzer,
-                log=(lambda *a: None) if quiet else print, on_record=on_record)
+                log=_log, on_record=on_record)
     rows, first_warm, verified_at = [], None, None
     act = 0
     emit({"type": "run_start", "seed": seed, "fabric_on": fabric_on,

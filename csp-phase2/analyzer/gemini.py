@@ -31,11 +31,6 @@ from analyzer import rules
 from core.registry import TUNABLE_BOUNDS
 from metrics.telemetry import SLO_MSG_LATENCY_P95_MS
 
-# Doc 4 §9.2 named gemini-2.0-flash; we default to 2.5-flash. Free-tier quota is
-# per-project-PER-MODEL, and 2.0-flash's daily quota is routinely exhausted on a
-# shared key while 2.5-flash still answers -- switching model is the cheapest fix
-# for a 429 mid-rehearsal. Configurable rather than literal: the model id is
-# deployment config, not a design decision. `GEMINI_MODEL` overrides it.
 def _load_env() -> None:
     """Read `.env` (repo root or csp-phase2/) into os.environ if not already set.
 
@@ -59,9 +54,23 @@ def _load_env() -> None:
 
 _load_env()
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Doc 4 §9.2 named gemini-2.0-flash; we default to the `-latest` ALIAS instead.
+# Two things bite a pinned model id here, both observed on this project's own keys:
+#   * 404 "no longer available to new users" -- a pinned version can be LISTED by the
+#     models endpoint and still refuse generateContent for a newer project. Listing
+#     is not callability.
+#   * 429 -- free-tier quota is per-project-PER-MODEL, so one model can be dead while
+#     another answers fine.
+# An alias resolves to a current model and survives both. Configurable rather than
+# literal: the model id is deployment config, not a design decision. `GEMINI_MODEL`
+# overrides it -- and if that 404s or 429s, the fallback to rules still holds.
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-TIMEOUT_S = 10.0
+# Doc 4 §9.2 said 10 s. Measured: a real grounded call on gemini-flash-latest takes
+# ~15 s, because the current flash models THINK before answering (454 thinking tokens
+# on our prompt) -- the 10 s budget predates that and timed out every single call,
+# silently demoting every run to rules. 30 s is sized to the model that exists.
+TIMEOUT_S = 30.0
 RETRIES = 1  # one retry, then rules. The demo never waits on a model.
 
 SYSTEM = (
@@ -137,8 +146,15 @@ def _call(prompt: str) -> tuple[dict | None, str]:
                 note += " (key rejected)"
             _log({"prompt": prompt, "error": note, "attempt": attempt})
         except (urllib.error.URLError, OSError, TimeoutError) as e:
-            note = f"network/timeout: {type(e).__name__}"
+            reason = getattr(e, "reason", e)
+            timed_out = isinstance(e, TimeoutError) or isinstance(reason, TimeoutError)
+            note = (f"timed out after {TIMEOUT_S:.0f}s on {MODEL}" if timed_out
+                    else f"network: {type(e).__name__}")
             _log({"prompt": prompt, "error": note, "attempt": attempt})
+            if timed_out:
+                # Retrying a timeout just doubles the stall in front of an audience,
+                # and rules answers instantly. The retry is for transient faults.
+                break
         except (KeyError, IndexError, ValueError) as e:
             note = f"unparseable response: {type(e).__name__}"
             _log({"prompt": prompt, "error": note, "attempt": attempt})
