@@ -8,11 +8,19 @@ Everything below is measured by the code in this repo. Nothing is mocked.
 
 ## Run it
 
-Python 3.11+. Dependencies: `cryptography`, `matplotlib` (charts only), `pytest` (tests only).
+Python 3.11+ and a venv. Everything is in `csp-phase2/requirements.txt`.
 
 ```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r csp-phase2/requirements.txt
 cd csp-phase2
+```
 
+> `uvicorn[standard]` is not optional — plain `uvicorn` ships no WebSocket library, so the
+> UI renders perfectly and streams nothing. Only `cryptography` is needed for the protocol
+> itself; matplotlib is charts, pytest is tests, fastapi/uvicorn are the UI.
+
+```bash
 # Phase 1 — one semantic handshake, fully narrated
 python -m demo.run_handshake --seed 42
 python -m demo.run_handshake --seed 42 --flip     # flip competence -> different settlement
@@ -23,9 +31,6 @@ python -m demo.run_demo --seed 42 --chaos --charts
 # baseline for comparison (same seed, pipeline disabled)
 python -m demo.run_demo --seed 42 --fabric off
 
-# Live UI — task stream, fabric replicas, insight lifecycle, chaos buttons
-python -m ui.server                                # -> http://127.0.0.1:8000
-
 pytest -q                                          # 94 tests
 ```
 
@@ -33,7 +38,45 @@ Artifacts land in `csp-phase2/out/`: `summary.md`, `telemetry.jsonl`,
 `fabric_N{1,2,3}.jsonl`, `charts/*.png`.
 
 Add `--no-color` for a plain terminal, `--pace 0.15` to slow the narration down for a
-live audience.
+live audience, `--analyzer gemini` to draft hypotheses with an LLM (see below).
+
+## Run the live UI
+
+```bash
+cd csp-phase2
+python -m ui.server                 # -> http://127.0.0.1:8000
+```
+
+Open the page and **press ▶ Run 30 tasks**. Nothing runs until you do — the server starts
+idle so you control when the demo begins in front of an audience.
+
+What happens, in order:
+
+1. The **baseline** runs first, silently (same seed, pipeline off). It costs nothing —
+   time is virtual — and it is what the grey bars are measured against.
+2. The **task stream** fills top-down. Watch rounds collapse **5 → 1** at task ~14 while
+   the era stays lossy: the link is still slow, the fabric just stopped re-deriving the
+   answer. Tasks 21–24 show the lossy insight *correctly not applied* to normal traffic;
+   tasks 25–30 show **N3 reusing N1's insight, having never seen the incident**.
+3. The **insight lifecycle** panel fills on the SLO breach: analyzer → guardrail → peer
+   replay → two matching replay hashes → VERIFIED.
+4. The **three node columns** converge on one digest. Chain heads differ by design.
+
+Then press the chaos buttons — **F1 node down**, **F2 poison ×4**, **F3 partition**.
+They stay disabled until a run finishes, because they fire at the *live* mesh that run
+built. F2 is the one to hand a judge: four poisoned updates die at four different layers,
+and the fabric stays converged.
+
+| control | does |
+|---|---|
+| `seed` | any seed; 42 is the rehearsed one |
+| `analyzer` | `rules` (deterministic, rehearse on this) or `gemini` |
+| `pace` | seconds per task — presentation only, never physics. The numbers come from the virtual clock and do not move when you slow it down. |
+
+The UI is a **subscriber**, not a component: it renders `run()`'s `on_event` and
+`Telemetry.on_record` — the same code path the terminal demo and the tests exercise. Pull
+it out and the fabric behaves identically; it cannot sign, vote, or promote anything.
+If it dies mid-demo, `python -m demo.run_demo --seed 42 --chaos` is the same run.
 
 ## What it does
 
@@ -137,7 +180,8 @@ claim we have not checked ourselves.
   availability attack, not an integrity one, and the entry is signed so it is
   attributable. Owned, not solved.
 - **Telemetry is OTel-*shaped* JSONL**, not the OTel SDK.
-- No web dashboard; the terminal and the charts are the interface.
+- **The UI has no auth and binds to localhost.** It is a demo viewer, not a product; it
+  also has no write path into the fabric, so there is nothing in it to authorise.
 
 ## Layout
 
@@ -174,10 +218,22 @@ wrong is free: a bad hypothesis costs one replay and dies. Rules stay primary an
 on; any failure (no key, timeout, bad JSON, ungrounded output) falls back to them, loudly.
 Rehearse it with `GEMINI_API_KEY` unset — the gate firing is the point.
 
+```bash
+export GEMINI_API_KEY=...            # optional; without it, rules, loudly
+python -m demo.run_demo --seed 42 --analyzer gemini
+```
+
+Note that `--analyzer gemini` makes *drafting* non-deterministic, so the same seed no
+longer reproduces byte-identically. That is correct, not a regression: reproducibility is
+a property of the verification plane, not of the hypothesis. **Demo on `rules`; show
+`gemini` as the upgrade.** Every prompt and response is logged to `out/gemini_log.jsonl`.
+
+## The docs
+
 The build plans this implements are `04_phase2_implementation_plan.md` (the fabric) and
 `05_phase2_agents_and_ui_plan.md` (the analyzer and UI). Docs 01–03
 (architecture, Phase 1 prototype spec, scalability roadmap) are the Phase 1 blueprint and
 are currently excluded by `.gitignore`, as are the Cisco-Confidential problem statements.
 
-Where code and Doc 4 diverge, the divergence is documented in-file at the point of
+Where code and the docs diverge, the divergence is documented in-file at the point of
 departure, and summarised in "Design decisions worth defending" above.
