@@ -1,0 +1,167 @@
+"""Telemetry + SLO evaluation (Doc 4 §8.1).
+
+JSONL spans and metrics with OpenTelemetry-convention-shaped names and
+attributes. We emit the wire shape, not the SDK: no collector, no exporter, no
+background threads to make deterministic. Swapping `Telemetry` for an OTel
+tracer is a file-sized change and is the documented production path.
+
+The SLO evaluator is the thing that turns raw numbers into a decision. "10 ms a
+hop is fine; 1 s a hop is an incident" is not a human judgement here -- it is
+`p95 message latency <= 50 ms` over a rolling window, and when it trips, the
+evaluator hands the analyzer the window stats AND the worst spans, so the
+analyzer can say WHERE it went slow rather than merely that it did.
+"""
+from __future__ import annotations
+
+import json
+import os
+from collections import defaultdict, deque
+
+from core.types import Incident
+
+# Hardcoded SLO table. These are the numbers the demo is judged against.
+SLO_MSG_LATENCY_P95_MS = 50.0
+SLO_CONTRACT_DURATION_MS = 5000.0
+SLO_ABORT_RATE = 0.10
+SLO_WINDOW = 5
+
+SLO_TABLE = {
+    "message_latency": {"metric": "csp.message.latency_ms", "stat": "p95",
+                        "threshold": SLO_MSG_LATENCY_P95_MS, "window": SLO_WINDOW},
+    "contract_duration": {"metric": "csp.contract.duration_ms", "stat": "p95",
+                          "threshold": SLO_CONTRACT_DURATION_MS, "window": SLO_WINDOW},
+    "abort_rate": {"metric": "csp.abort.count", "stat": "rate",
+                   "threshold": SLO_ABORT_RATE, "window": SLO_WINDOW},
+}
+
+
+def p95(values: list) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    # Nearest-rank p95. Deterministic; no interpolation to argue about.
+    k = max(0, min(len(s) - 1, int(round(0.95 * len(s) + 0.5)) - 1))
+    return s[k]
+
+
+class Telemetry:
+    def __init__(self, out_path: str | None = None, clock=None):
+        self.clock = clock
+        self.records: list = []
+        self.by_session: dict = defaultdict(list)  # session -> [latency_ms]
+        self.counters: dict = defaultdict(int)
+        self.out_path = out_path
+        if out_path:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            open(out_path, "w").close()
+
+    def _write(self, rec: dict) -> None:
+        self.records.append(rec)
+        if self.out_path:
+            with open(self.out_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
+
+    def metric(self, name: str, value: float, attrs: dict | None = None) -> None:
+        attrs = attrs or {}
+        self._write({"kind": "metric", "name": name, "value": value,
+                     "ts_ms": self.clock.now() if self.clock else None, "attrs": attrs})
+        if name == "csp.message.latency_ms" and attrs.get("session"):
+            self.by_session[attrs["session"]].append(value)
+
+    def count(self, name: str, attrs: dict | None = None, value: int = 1) -> None:
+        self.counters[name] += value
+        self._write({"kind": "metric", "name": name, "value": value,
+                     "ts_ms": self.clock.now() if self.clock else None, "attrs": attrs or {}})
+
+    def span(self, name: str, attrs: dict, start_ms: float, duration_ms: float) -> None:
+        self._write({"kind": "span", "name": name, "start_ms": start_ms,
+                     "duration_ms": duration_ms, "attrs": attrs})
+
+    def event(self, name: str, attrs: dict) -> None:
+        self._write({"kind": "event", "name": name,
+                     "ts_ms": self.clock.now() if self.clock else None, "attrs": attrs})
+
+    def session_latencies(self, session: str) -> list:
+        return list(self.by_session.get(session, []))
+
+
+class SLOEvaluator:
+    """Rolling-window SLO checks. on_task_end -> Incident | None."""
+
+    def __init__(self, telemetry: Telemetry, window: int = SLO_WINDOW):
+        self.tel = telemetry
+        self.window = window
+        self.latencies: deque = deque(maxlen=window * 40)
+        self.durations: deque = deque(maxlen=window)
+        self.aborts: deque = deque(maxlen=window)
+        self._n = 0
+
+    def on_task_end(self, node: str, task_ctx: dict, result, session: str,
+                    scenario: dict) -> Incident | None:
+        self._n += 1
+        lats = self.tel.session_latencies(session)
+        self.latencies.extend(lats)
+        self.durations.append(result.duration_ms)
+        self.aborts.append(1 if result.aborted else 0)
+
+        self.tel.metric("csp.contract.duration_ms", result.duration_ms,
+                        {"node": node, "session": session, **_ctx_attrs(task_ctx)})
+        self.tel.metric("csp.contract.rounds", result.rounds,
+                        {"node": node, "session": session, **_ctx_attrs(task_ctx)})
+        if result.aborted:
+            self.tel.count("csp.abort.count",
+                           {"node": node, "reason": result.abort_reason, **_ctx_attrs(task_ctx)})
+
+        if len(self.durations) < self.window:
+            return None  # never fire on a window we have not filled
+
+        lat_p95 = p95(list(self.latencies))
+        dur_p95 = p95(list(self.durations))
+        abort_rate = sum(self.aborts) / len(self.aborts)
+
+        stats = {"p95": lat_p95, "n": len(self.latencies),
+                 "duration_p95": dur_p95, "abort_rate": abort_rate,
+                 "window": self.window}
+
+        breach = None
+        if lat_p95 > SLO_MSG_LATENCY_P95_MS:
+            breach, stats["threshold"] = "message_latency", SLO_MSG_LATENCY_P95_MS
+        elif abort_rate > SLO_ABORT_RATE:
+            breach, stats["p95"] = "abort_rate", abort_rate
+            stats["threshold"] = SLO_ABORT_RATE
+        elif dur_p95 > SLO_CONTRACT_DURATION_MS:
+            breach, stats["p95"] = "contract_duration", dur_p95
+            stats["threshold"] = SLO_CONTRACT_DURATION_MS
+        if breach is None:
+            return None
+
+        worst = sorted(
+            [r for r in self.tel.records
+             if r.get("kind") == "metric" and r["name"] == "csp.message.latency_ms"
+             and r["attrs"].get("session") == session],
+            key=lambda r: -r["value"],
+        )[:3]
+        worst_spans = [
+            {"span_id": f"{r['attrs'].get('session')}/{r['attrs'].get('type')}/{i}",
+             "from": r["attrs"].get("from"), "to": r["attrs"].get("to"),
+             "type": r["attrs"].get("type"), "latency_ms": round(r["value"], 1)}
+            for i, r in enumerate(worst)
+        ]
+
+        inc = Incident(
+            id=f"inc-{self._n:02d}",
+            breached_slo=breach,
+            window_stats=stats,
+            worst_spans=worst_spans,
+            task_ctx=dict(task_ctx),
+            node=node,
+            scenario=scenario,
+        )
+        self.tel.event("slo.breach", {"incident": inc.id, "slo": breach,
+                                      "value": round(stats["p95"], 1),
+                                      "threshold": stats["threshold"], "node": node})
+        return inc
+
+
+def _ctx_attrs(ctx: dict) -> dict:
+    return {"link_quality": ctx.get("link_quality"), "workload": ctx.get("workload")}
