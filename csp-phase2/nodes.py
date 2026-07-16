@@ -28,11 +28,15 @@ from fabric.log import (
 )
 from fabric.model import Insight, make_insight
 from guardrail.guardrail import Guardrail
-from insights.pipeline import active_params, verify
+from insights.pipeline import IMPROVEMENT_RATIO, active_params, verify
 from loadgen.tasks import delay_for
 from metrics.telemetry import SLOEvaluator, Telemetry
 
 PERSONAS = ("throughput", "security")
+
+# Probation: watch N live applications, revoke on FAIL regressions.
+PROBATION_N = 3
+PROBATION_FAIL = 2
 
 
 class Node:
@@ -237,19 +241,36 @@ class Mesh:
     # --- probation / revoke (cheap canary, Doc 4 §7.4) ------------------------
 
     def _probation_tick(self, node: Node, ids: list, res) -> None:
-        """The first 3 live applications of a VERIFIED insight are watched. If 2 of
-        3 breach the contract-duration SLO, the node revokes it and its
-        derived_from descendants. Rollback = fold the log without it; nothing is
-        deleted and the revoke is itself a signed, auditable entry."""
-        from metrics.telemetry import SLO_CONTRACT_DURATION_MS
+        """Watch the first 3 live applications of a VERIFIED insight; revoke it and
+        its derived_from descendants if 2 of 3 regress.
 
+        The bar is the one it already cleared to get verified: it proved it beats
+        the cold baseline by IMPROVEMENT_RATIO, so we check that it still does, in
+        the live world. We deliberately do NOT test it against the absolute SLO.
+        An insight that takes a 9s negotiation down to 6s is delivering exactly
+        what it proved, even though 6s is still over a 5s SLO -- on a 1800ms/hop
+        link no negotiation can fit in 5s, because six messages have to cross it.
+        Revoking on the absolute SLO throws away real verified knowledge for
+        failing to fix the weather, and the node then re-derives the same insight
+        forever. Regression is the signal; environment is not.
+
+        Rollback = fold the log without it. Nothing is deleted, and the revoke is
+        itself a signed, auditable entry.
+        """
+        state = node.state()
         for iid in ids:
-            hist = node.probation.setdefault(iid, [])
-            if len(hist) >= 3:
+            ins = state.get(iid)
+            if not ins:
                 continue
-            hist.append(res.aborted or res.duration_ms > SLO_CONTRACT_DURATION_MS)
-            if len(hist) == 3 and sum(hist) >= 2:
-                self.revoke(node, iid, "PROBATION_SLO_REGRESSION")
+            hist = node.probation.setdefault(iid, [])
+            if len(hist) >= PROBATION_N:
+                continue
+            before = (ins.get("evidence", {}).get("metric_before", {}) or {}).get("duration_ms")
+            if not before:
+                continue
+            hist.append(bool(res.aborted or res.duration_ms > before * IMPROVEMENT_RATIO))
+            if len(hist) == PROBATION_N and sum(hist) >= PROBATION_FAIL:
+                self.revoke(node, iid, "PROBATION_REGRESSION")
 
     def revoke(self, node: Node, insight_id: str, reason: str) -> list:
         """Prune by provenance subtree. Tombstone, never rewrite."""

@@ -39,7 +39,13 @@ def node_of(entity_id: str) -> str:
 
 
 NORMAL_DELAY_MS = (5.0, 10.0)
-LOSSY_DELAY_MS = (400.0, 1200.0)
+# Upper bound is 1800, not 1200, and the difference is load-bearing: at 1200 a
+# cold lossy negotiation always squeaks in under the 10s default budget, so
+# nothing ever times out, the abort-rate SLO never fires, and an insight raising
+# negotiate_timeout_ms buys literally nothing. At 1800 roughly a third of cold
+# lossy negotiations blow the budget and abort -- which is the failure the
+# timeout tunable actually exists to fix.
+LOSSY_DELAY_MS = (400.0, 1800.0)
 
 
 @dataclass

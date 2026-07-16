@@ -407,9 +407,27 @@ def test_the_ratchet_is_real_against_a_fabric_off_baseline():
     _off, off = run(False)
     m_on, on = run(True)
 
-    lossy_off = [r["result"].duration_ms for r in off if r["task"].link_quality == "lossy"]
-    lossy_on = [r["result"].duration_ms for r in on if r["task"].link_quality == "lossy"]
-    assert sum(lossy_on) / len(lossy_on) < 0.75 * (sum(lossy_off) / len(lossy_off))
+    def lossy(rs):
+        return [r for r in rs if r["task"].link_quality == "lossy"]
+
+    def mean(xs):
+        return sum(xs) / len(xs)
+
+    l_off, l_on = lossy(off), lossy(on)
+
+    # Rounds is the honest headline: it is what the remembered settlement removes,
+    # and unlike duration it is not distorted by the baseline's aborts (which are
+    # capped at the timeout budget and produced no contract at all).
+    assert mean([r["result"].rounds for r in l_on]) < 0.6 * mean(
+        [r["result"].rounds for r in l_off])
+    assert mean([r["result"].duration_ms for r in l_on]) < 0.85 * mean(
+        [r["result"].duration_ms for r in l_off])
+
+    # Fewer negotiations collapse entirely.
+    aborts_off = sum(1 for r in l_off if r["result"].aborted)
+    aborts_on = sum(1 for r in l_on if r["result"].aborted)
+    assert aborts_off > 0, "the cold lossy era must actually blow the timeout budget"
+    assert aborts_on < aborts_off, "the fabric must reduce collapses, not just latency"
 
     # Cross-node reuse: N3 applies an insight it never discovered (deliverable 5).
     n3 = [r for r in on if r["node"] == "N3" and r["insight_ids"]]
