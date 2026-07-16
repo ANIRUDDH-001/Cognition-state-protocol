@@ -90,7 +90,13 @@ def level_index(dim_id: str, value: str) -> int:
 # Both agents evaluate this identically (it is registry-declared, not private),
 # so determinism of the shared feasibility check is preserved.
 
-INSPECTION_COST_MS = {"none": 0.0, "header": 1.0, "selective_deep": 12.0, "full_deep": 30.0}
+# Per-flow inspection cost in ms. full_deep is 20, not 30, and the difference
+# matters: at 30 the throughput agent's 12 ms budget admits exactly ONE feasible
+# sample_rate under full_deep, so the security agent has no intermediate move --
+# it can only hold its optimum or collapse to selective_deep, and the transcript
+# shows it repeating an identical offer until the other side caves. At 20 it can
+# trade coverage away gradually, which is what a negotiation is supposed to look like.
+INSPECTION_COST_MS = {"none": 0.0, "header": 1.0, "selective_deep": 12.0, "full_deep": 20.0}
 BASE_LATENCY_MS = 2.0
 THROUGHPUT_CEILING_MBPS = 10000.0
 THROUGHPUT_COST_PER_MS = 200.0
