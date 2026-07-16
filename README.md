@@ -154,7 +154,9 @@ csp-phase2/
   nodes.py    Node = personas + fabric replica + guardrail + analyzer; Mesh
 ```
 
-Design docs: `01_architecture_design_plan.md`, `02_prototype_implementation_spec.md`,
-`03_scalability_hardening_roadmap.md`, `04_phase2_implementation_plan.md`.
+The build plan this implements is `04_phase2_implementation_plan.md`. Docs 01–03
+(architecture, Phase 1 prototype spec, scalability roadmap) are the Phase 1 blueprint and
+are currently excluded by `.gitignore`, as are the Cisco-Confidential problem statements.
+
 Where code and Doc 4 diverge, the divergence is documented in-file at the point of
-departure and in "Design decisions worth defending" above.
+departure, and summarised in "Design decisions worth defending" above.
