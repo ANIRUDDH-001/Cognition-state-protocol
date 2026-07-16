@@ -31,9 +31,35 @@ from analyzer import rules
 from core.registry import TUNABLE_BOUNDS
 from metrics.telemetry import SLO_MSG_LATENCY_P95_MS
 
-# Doc 4 §9.2 named gemini-2.0-flash. Kept configurable rather than literal: the
-# model id is deployment config, not a design decision.
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+# Doc 4 §9.2 named gemini-2.0-flash; we default to 2.5-flash. Free-tier quota is
+# per-project-PER-MODEL, and 2.0-flash's daily quota is routinely exhausted on a
+# shared key while 2.5-flash still answers -- switching model is the cheapest fix
+# for a 429 mid-rehearsal. Configurable rather than literal: the model id is
+# deployment config, not a design decision. `GEMINI_MODEL` overrides it.
+def _load_env() -> None:
+    """Read `.env` (repo root or csp-phase2/) into os.environ if not already set.
+
+    Ten lines instead of a python-dotenv dependency. The file is gitignored: the
+    key belongs on the demo machine, never in the history of a repo that gets
+    handed to judges. A real environment variable always wins over the file.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, "..", ".env"), os.path.join(here, "..", "..", ".env")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        except OSError:
+            pass
+
+
+_load_env()
+
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TIMEOUT_S = 10.0
 RETRIES = 1  # one retry, then rules. The demo never waits on a model.
@@ -73,11 +99,17 @@ def _prompt(incident) -> str:
     }, sort_keys=True, default=str)
 
 
-def _call(prompt: str) -> dict | None:
-    """POST to the API. Returns parsed model JSON, or None on ANY failure."""
+def _call(prompt: str) -> tuple[dict | None, str]:
+    """POST to the API. Returns (parsed model JSON, note). Never raises.
+
+    The note carries the REAL reason on failure. "no key / no response" for
+    everything is useless at 3am before a demo: a 429 (free-tier quota, which is
+    per-project-per-model -- try GEMINI_MODEL=gemini-2.0-flash) and a 403 (bad key)
+    need completely different fixes, and the fallback hides both by design.
+    """
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        return None
+        return None, "GEMINI_API_KEY not set"
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -85,6 +117,7 @@ def _call(prompt: str) -> dict | None:
     }).encode()
     url = ENDPOINT.format(model=MODEL) + "?key=" + key
 
+    note = "no response"
     for attempt in range(RETRIES + 1):
         try:
             req = urllib.request.Request(
@@ -93,12 +126,23 @@ def _call(prompt: str) -> dict | None:
                 raw = json.loads(resp.read().decode())
             text = raw["candidates"][0]["content"]["parts"][0]["text"]
             out = json.loads(text)
-            _log({"prompt": prompt, "response": text, "attempt": attempt})
-            return out
-        except (urllib.error.URLError, OSError, KeyError, IndexError,
-                ValueError, TimeoutError) as e:
-            _log({"prompt": prompt, "error": f"{type(e).__name__}: {e}", "attempt": attempt})
-    return None
+            _log({"prompt": prompt, "response": text, "model": MODEL, "attempt": attempt})
+            return out, ""
+        except urllib.error.HTTPError as e:
+            # Never let the key reach a log line or the terminal: the URL carries it.
+            note = f"HTTP {e.code} from {MODEL}"
+            if e.code == 429:
+                note += " (free-tier quota exhausted -- try another GEMINI_MODEL)"
+            elif e.code in (401, 403):
+                note += " (key rejected)"
+            _log({"prompt": prompt, "error": note, "attempt": attempt})
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            note = f"network/timeout: {type(e).__name__}"
+            _log({"prompt": prompt, "error": note, "attempt": attempt})
+        except (KeyError, IndexError, ValueError) as e:
+            note = f"unparseable response: {type(e).__name__}"
+            _log({"prompt": prompt, "error": note, "attempt": attempt})
+    return None, note
 
 
 def ground(out, incident, last_agreed: dict | None) -> tuple[dict | None, str, str]:
@@ -158,9 +202,9 @@ def ground(out, incident, last_agreed: dict | None) -> tuple[dict | None, str, s
 
 def propose_claim(incident, last_agreed: dict | None = None) -> tuple[dict | None, str, str]:
     """(claim, hypothesis, reason_if_rejected). Never raises."""
-    out = _call(_prompt(incident))
+    out, note = _call(_prompt(incident))
     if out is None:
-        return None, "", "no key / no response"
+        return None, "", note
     return ground(out, incident, last_agreed)
 
 

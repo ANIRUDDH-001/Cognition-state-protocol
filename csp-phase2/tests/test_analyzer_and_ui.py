@@ -119,7 +119,7 @@ def test_gemini_falls_back_to_rules_without_a_key(monkeypatch):
     """The demo must never wait on, or depend on, a model. Rehearsed unplugged."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     claim, _h, why = gemini.propose_claim(incident(), GOOD_WARM)
-    assert claim is None and "no key" in why
+    assert claim is None and "GEMINI_API_KEY not set" in why
 
     logged = []
     inc = incident()

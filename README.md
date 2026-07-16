@@ -219,8 +219,23 @@ on; any failure (no key, timeout, bad JSON, ungrounded output) falls back to the
 Rehearse it with `GEMINI_API_KEY` unset — the gate firing is the point.
 
 ```bash
-export GEMINI_API_KEY=...            # optional; without it, rules, loudly
+cp .env.example .env                 # then paste the key into .env (repo root)
 python -m demo.run_demo --seed 42 --analyzer gemini
+```
+
+`.env` is gitignored and **must stay that way**. This repo gets handed to judges, and a
+key committed once lives in the git history even after the file is deleted; GitHub's
+secret scanning would flag it and Google may auto-revoke it — possibly mid-demo. Private
+repos are not a secret store. Nothing is lost: `.env` gives the same convenience.
+
+Free-tier quota is per-project-**per-model**, so `HTTP 429` does not mean the key is dead
+— set `GEMINI_MODEL` to another model (`gemini-2.0-flash`, `gemini-2.5-flash`) and it will
+usually answer. Failures name the model and status code and fall back to rules, so a bad
+key or an exhausted quota costs the demo nothing:
+
+```
+[analyzer] gemini output rejected: HTTP 429 from gemini-2.0-flash
+           (free-tier quota exhausted -- try another GEMINI_MODEL) -- using rules
 ```
 
 Note that `--analyzer gemini` makes *drafting* non-deterministic, so the same seed no
