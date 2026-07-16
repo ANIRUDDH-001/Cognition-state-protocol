@@ -555,7 +555,13 @@ def negotiate(
         for x in (a, b):
             u_min[x] = min(U[x])
             u_max[x] = U[x][anchor_i] if anchor_i is not None else max(U[x])
-        step = {x: max(eps, (u_max[x] - u_min[x]) / r_max) for x in (a, b)}
+        # r_max caps TOTAL rounds, but a side only offers on every other round, so
+        # its schedule must complete within its own share of the cap. Dividing by
+        # r_max instead of r_max/2 leaves both sides still halfway up their
+        # schedules when the cap hits, and every negotiation lands on the midpoint
+        # fallback instead of converging by acceptance.
+        steps_per_side = max(1, r_max // 2)
+        step = {x: max(eps, (u_max[x] - u_min[x]) / steps_per_side) for x in (a, b)}
 
         def target(x: str, n: int) -> float:
             return u_max[x] - step[x] * (n - 1)
