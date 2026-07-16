@@ -64,7 +64,19 @@ _load_env()
 # An alias resolves to a current model and survives both. Configurable rather than
 # literal: the model id is deployment config, not a design decision. `GEMINI_MODEL`
 # overrides it -- and if that 404s or 429s, the fallback to rules still holds.
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+#
+# The default is pinned to 3.1-flash-lite rather than the `gemini-flash-latest`
+# alias, for two MEASURED reasons on this project's free tier:
+#   latency -- flash-latest answered this prompt in 15.6s, past TIMEOUT_S below.
+#              A model slower than the timeout does not fail loudly; it silently
+#              becomes a rules run wearing a gemini badge. 3.1-flash-lite: 1.0s.
+#   quota   -- 500 RPD / 15 RPM, against 20 RPD for 2.5-flash / 3-flash /
+#              3.5-flash. One demo run costs a call; 20/day does not survive a
+#              rehearsal day plus the demo.
+# An alias also silently repoints, which is the one thing you do not want between
+# rehearsal and demo. A small model is safe here precisely because it only guesses
+# a hypothesis: the grounding gate and our own replay decide whether it is true.
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 # Doc 4 §9.2 said 10 s. Measured: a real grounded call on gemini-flash-latest takes
 # ~15 s, because the current flash models THINK before answering (454 thinking tokens
@@ -236,6 +248,18 @@ def analyze(incident, last_agreed: dict | None = None, defaults: dict | None = N
         log("[analyzer] gemini hypothesis grounded -- replaying it before submitting")
     # Identical path from here: evidence, self-replay, and drop-if-unreproduced.
     draft = rules.build_draft(incident, claim, defaults, "gemini", hypothesis=hypothesis)
-    if draft is None and log:
-        log("[analyzer] gemini claim did not reproduce on our own replay -- discarded")
-    return draft
+    if draft is not None:
+        return draft
+
+    # A grounded claim that our own replay will not reproduce is still a rejection,
+    # and this function promises to fall back to rules on ANY rejection. Returning
+    # None here instead means the node draws a blank on this incident and the
+    # ratchet only fires if a LATER incident happens to arrive -- observed live:
+    # gemini's task-13 claim failed self-replay, and the run was rescued purely by
+    # task 14 breaching again. On the last incident of an era there is no rescue,
+    # and the demo silently has no insight at all. The rule table's hypothesis is
+    # right there and costs nothing; the discard stays visible in the log either way.
+    if log:
+        log("[analyzer] gemini claim did not reproduce on our own replay "
+            "-- discarded, using rules")
+    return rules.analyze(incident, last_agreed, defaults)

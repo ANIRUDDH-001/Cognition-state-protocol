@@ -129,6 +129,31 @@ def test_gemini_falls_back_to_rules_without_a_key(monkeypatch):
     assert any("gemini output rejected" in m for m in logged), "the gate must say so out loud"
 
 
+def test_gemini_falls_back_to_rules_when_its_claim_fails_our_own_replay(monkeypatch):
+    """The OTHER rejection path, and the one that bites live.
+
+    A grounded, in-bounds, perfectly plausible claim that simply does not
+    reproduce is still a rejection. Returning None here means the node draws a
+    blank on this incident and the ratchet only fires if a later incident happens
+    to arrive -- observed live: gemini's task-13 claim failed self-replay and the
+    run was rescued purely by task 14 breaching again. On the last incident of an
+    era there is no rescue.
+    """
+    # Grounded and legal, but it changes nothing that matters: no warm start, and
+    # a round cap the negotiation never reaches. Self-replay must refuse it.
+    monkeypatch.setattr(gemini, "propose_claim",
+                        lambda *_a, **_k: ({"params": {"r_max": 12}}, "gemini: a hunch", ""))
+    logged = []
+    inc = incident()
+    inc.scenario = _real_scenario()
+    draft = gemini.analyze(inc, GOOD_WARM, DEFAULT_PARAMS, log=logged.append)
+
+    assert draft is not None, "a claim we refused must fall back, not silence the node"
+    assert draft["analyzer"] == "rules"
+    assert draft["claim"].get("warm_start"), "the rules draft must be the real one"
+    assert any("did not reproduce" in m for m in logged), "the discard must stay visible"
+
+
 def _real_scenario() -> dict:
     from core.bus import LOSSY_DELAY_MS, FaultState
     from core.csp_mini import build_scenario, make_agent
