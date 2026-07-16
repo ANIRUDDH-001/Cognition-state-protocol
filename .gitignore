@@ -1,3 +1,6 @@
 *
 !.gitignore
 !README.md
+!csp-phase2/
+!csp-phase2/**
+!04_phase2_implementation_plan.md
