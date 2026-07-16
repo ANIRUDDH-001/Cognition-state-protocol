@@ -513,6 +513,7 @@ def negotiate(
             abort_reason=reason,
             transcript_hash=thash,
             messages=len(transcript),
+            transcript=list(transcript),
         )
 
     try:

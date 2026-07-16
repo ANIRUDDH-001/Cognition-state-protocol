@@ -52,6 +52,11 @@ class NegotiationResult:
     abort_reason: Optional[str] = None
     transcript_hash: str = ""
     messages: int = 0
+    # Every signed envelope of the session, in order. Audit + demo material.
+    # Deliberately NOT part of summary(): the replay hash must depend on the
+    # negotiation's OUTCOME, not on nonces and timestamps that legitimately
+    # differ between two nodes verifying the same claim.
+    transcript: list = field(default_factory=list)
 
     def summary(self) -> dict:
         """Everything a peer must reproduce byte-identically to attest."""
