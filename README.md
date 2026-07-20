@@ -31,7 +31,7 @@ python -m demo.run_demo --seed 42 --chaos --charts
 # baseline for comparison (same seed, pipeline disabled)
 python -m demo.run_demo --seed 42 --fabric off
 
-pytest -q                                          # 94 tests
+pytest -q                                          # 101 tests
 ```
 
 Artifacts land in `csp-phase2/out/`: `summary.md`, `telemetry.jsonl`,
@@ -198,7 +198,7 @@ csp-phase2/
   loadgen/    seeded task flow with condition eras
   chaos/      F1 node down, F2 poisoned updates, F3 partition/heal
   demo/       run_handshake.py (Phase 1), run_demo.py (Phase 2), charts.py
-  tests/      94 tests: Phase 1 core, Phase 2 fabric, chaos + demo, analyzer + UI
+  tests/      101 tests: Phase 1 core, Phase 2 fabric, chaos + demo, analyzer + UI
   nodes.py    Node = personas + fabric replica + guardrail + analyzer; Mesh
 ```
 
@@ -243,12 +243,9 @@ longer reproduces byte-identically. That is correct, not a regression: reproduci
 a property of the verification plane, not of the hypothesis. **Demo on `rules`; show
 `gemini` as the upgrade.** Every prompt and response is logged to `out/gemini_log.jsonl`.
 
-## The docs
+## Repo structure
 
-The build plans this implements are `04_phase2_implementation_plan.md` (the fabric) and
-`05_phase2_agents_and_ui_plan.md` (the analyzer and UI). Docs 01–03
-(architecture, Phase 1 prototype spec, scalability roadmap) are the Phase 1 blueprint and
-are currently excluded by `.gitignore`, as are the Cisco-Confidential problem statements.
-
-Where code and the docs diverge, the divergence is documented in-file at the point of
-departure, and summarised in "Design decisions worth defending" above.
+The internal build plans (Docs 01–05) and Cisco-Confidential problem statements are
+kept out of the repository. Where code diverges from those plans, the divergence is
+documented in-file at the point of departure, and summarised in
+"Design decisions worth defending" above.
