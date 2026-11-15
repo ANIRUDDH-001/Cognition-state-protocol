@@ -42,3 +42,5 @@ Problem Statement*.pdf
 # --- OS ---
 Thumbs.db
 .DS_Store
+
+/.local-maintenance/
